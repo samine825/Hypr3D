@@ -16,6 +16,7 @@
 #include <hyprland/src/devices/IPointer.hpp>
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
+#include <hyprland/src/state/MonitorState.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 
 // This system's lua headers (5.5) lost the extern "C" guard: including them
@@ -251,6 +252,7 @@ static bool g_hookInstalled = false;
 // names; wrong-typed keys raise a lua error. Everything is clamped on set.
 // --- world ------------------------------------------------------------------
 static std::string g_cfgPanorama;                // panorama image path
+static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
 static bool        g_cfgGrid = true;             // base grid platform on/off
 
 // --- windows ----------------------------------------------------------------
@@ -383,9 +385,18 @@ static void damageCurrentMonitor() {
     );
 }
 
-// The monitor the 3D view is built for: whatever has keyboard focus, falling
-// back to whatever render.pre last reported.
+static PHLMONITOR g_currentRenderMon = nullptr;
+
+// The monitor the 3D view is built for: configured monitor, or focused monitor,
+// falling back to whatever render.pre last reported.
 static PHLMONITOR targetMonitor() {
+    if (!g_cfgMonitor.empty() && State::monitorState()) {
+        for (const auto& mon : State::monitorState()->monitors()) {
+            if (mon && mon->m_name == g_cfgMonitor)
+                return mon;
+        }
+    }
+
     if (const auto FOCUSED = Compat::focusedMonitor())
         return FOCUSED;
 
@@ -1677,14 +1688,18 @@ static void onRenderPre(PHLMONITOR mon) {
     if (g_capturing)
         return;
 
+    const auto TARGET = targetMonitor();
+    if (TARGET && mon != TARGET) {
+        g_currentRenderMon = nullptr;
+        return;
+    }
+
+    g_currentRenderMon = mon;
+
     if (!g_active) {
         g_monitor = mon;
         return;
     }
-
-    const auto FOCUSED = Compat::focusedMonitor();
-    if (FOCUSED && FOCUSED != mon)
-        return;
 
     g_monitor = mon;
     serviceCapture();
@@ -2498,6 +2513,9 @@ static void onRenderStage(eRenderStage stage) {
     if (stage != RENDER_LAST_MOMENT)
         return;
 
+    if (!g_currentRenderMon || g_currentRenderMon != g_monitor)
+        return;
+
     dumpStatus();
 
     const float dt = updateTransition();
@@ -3110,6 +3128,8 @@ static int luaConfig(lua_State* L) {
     if (idx > 0) {
         if (!SET_STRING(idx, "panorama", g_cfgPanorama, "world.panorama"))
             return luaL_error(L, "hypr3d.config: world.panorama must be a string");
+        if (!SET_STRING(idx, "monitor", g_cfgMonitor, "world.monitor"))
+            return luaL_error(L, "hypr3d.config: world.monitor must be a string");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         lua_pop(L, 1);
