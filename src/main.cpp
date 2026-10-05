@@ -56,6 +56,7 @@ extern "C" {
 #include "Input/AimFocus.hpp"
 #include "Input/InputController.hpp"
 #include "World/MapCollision.hpp"
+#include "World/ScreenProject.hpp"
 #include "World/World3D.hpp"
 #include "HyprlandCompat/WindowsCompat.hpp"
 #include "HyprlandCompat/FocusCompat.hpp"
@@ -115,6 +116,53 @@ static bool g_reportedPointerHookError = false;
 // layout's control.
 static std::vector<Compat::SWindowLayoutSave> g_layoutSaves;
 static bool g_ghosted = false;
+
+// --- 2D/3D independent positions + the view morph ---------------------------
+//
+// Positions are per-mode. The desktop keeps its own layout (ghosting
+// restores it exactly), and the room remembers where every window was
+// dragged: on the next toggle each window returns to ITS pose instead of
+// spawning at zero. Toggling itself is not a fade: every window's 2D
+// rectangle is back-projected onto the camera frustum plane -- the pose
+// where the quad covers its on-screen spot EXACTLY (the fullscreen
+// passthrough construction, generalized to every window) -- and the quad
+// flies from there to the room pose, while the environment fades in
+// per-pixel. No visible jump at either handoff.
+struct SViewPose {
+    Vec3  center{};
+    float yaw   = 0.f;
+    float pitch = 0.f;
+    float roll  = 0.f;
+};
+
+// Room poses remembered across toggles; keyed by window id, pruned against
+// the live room on every save (closed windows drop out).
+static std::unordered_map<std::uintptr_t, SViewPose> g_savedPoses;
+
+enum class EViewMorph : uint8_t { None, To3D, To2D };
+static EViewMorph g_viewMorph = EViewMorph::None;
+
+// Per-window morph endpoints, captured once when the morph starts.
+struct SViewMorphWin {
+    CBox      box2D{};    // monitor-local: the 2D rect covered at s=0
+    CBox      boxRoom{};  // monitor-local: the box whose content the room shows
+    SViewPose roomPose{}; // the room pose at s=1
+    bool      animBox = false; // drive the real box between the two
+    float     stack   = 0.f;   // world units toward the eye (2D stacking)
+};
+static std::unordered_map<std::uintptr_t, SViewMorphWin> g_viewMorphWins;
+
+// Enter morph waits for the first captures: the takeoff pose must show the
+// 2D content, so the pre-ghost snapshots have to exist before the table is
+// built (see serviceCapture).
+static bool g_viewMorphArmed = false;
+
+// Eased morph progress this frame (1 = the room). Diagnostics.
+static float g_morphS = 1.0f;
+
+// Coplanar 2D rectangles keep a stacking order by sitting this much closer
+// to the eye per list layer (~1 px of projection error, invisible).
+static constexpr float kMorphStackEps = 0.012f;
 
 // What to draw this frame, rebuilt once per frame from the world.
 static std::vector<GLScene::WindowRender> g_renderWindows;
@@ -271,6 +319,10 @@ static constexpr float kFsAnimDuration = 0.6f;
 
 static void pollFullscreen();
 static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox = true);
+
+// The 2D<->3D view morph (built once the first pre-ghost captures exist).
+static void buildEnterMorph(
+    const PHLMONITOR& mon, const std::vector<Compat::SWindowInfo>& infos);
 
 // Windows that appear while the view is open spawn as floating panels of
 // this logical size (see ghostWindows), and enter the room this far in front
@@ -1005,20 +1057,32 @@ static void clearAimFocus() {
 // triggers a relayout of the ones still attached, which would corrupt boxes
 // captured afterwards. Ghosting is what stops tiling from managing windows
 // while they are living in 3D space.
-static void ghostWindows(const PHLMONITOR& mon) {
+static void ghostWindows(
+    const PHLMONITOR& mon,
+    const std::vector<Compat::SWindowInfo>* infos = nullptr) {
     if (!mon)
         return;
 
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    // Callers that have already enumerated (the capture pass) pass the list
+    // in; the rest enumerate here, as before.
+    std::vector<Compat::SWindowInfo> enumerated;
+    const std::vector<Compat::SWindowInfo>* list = infos;
+
+    if (!list) {
+        enumerated = Compat::enumerateEligibleWindows(mon);
+        list       = &enumerated;
+    }
+
+    const auto& LIST = *list;
 
     if (!g_ghosted) {
         // First pass: save EVERY window before ghosting any of them, since
         // ghosting one window triggers a relayout of the ones still attached,
         // which would corrupt boxes captured afterwards.
         g_layoutSaves.clear();
-        g_layoutSaves.reserve(INFOS.size());
+        g_layoutSaves.reserve(LIST.size());
 
-        for (const auto& info : INFOS) {
+        for (const auto& info : LIST) {
             auto SAVE = Compat::saveWindowLayout(info.window);
 
             if (SAVE.window)
@@ -1037,7 +1101,7 @@ static void ghostWindows(const PHLMONITOR& mon) {
     // live layout target and every later spawn or close re-tiles the space
     // around it. The live weak reference guards against a new window reusing
     // a closed one's address.
-    for (const auto& info : INFOS) {
+    for (const auto& info : LIST) {
         bool known = false;
 
         for (const auto& save : g_layoutSaves) {
@@ -1253,8 +1317,21 @@ static void serviceCapture() {
 
     g_capturing = true;
 
-    ghostWindows(MON);
-    refreshCaptures(Compat::enumerateEligibleWindows(MON), MON);
+    const auto INFOS = Compat::enumerateEligibleWindows(MON);
+
+    if (g_viewMorphArmed) {
+        // First pass of a fresh 3D session: capture the windows BEFORE the
+        // ghosting touches them. The morph's takeoff frame must show the
+        // 2D content sitting at the 2D rectangles -- then the ghosting
+        // force-floats the windows and the real boxes follow the morph.
+        refreshCaptures(INFOS, MON);
+        ghostWindows(MON, &INFOS);
+        buildEnterMorph(MON, INFOS);
+        g_viewMorphArmed = false;
+    } else {
+        ghostWindows(MON, &INFOS);
+        refreshCaptures(INFOS, MON);
+    }
 
     g_capturing = false;
 }
@@ -1339,9 +1416,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // g_fsStableBoxes. Skipped while the exit re-assert is running: a
         // late Hyprland-side restore could pollute the memory with the
         // monitor-sized box, and the NEXT fullscreen cycle would then
-        // restore the giant size (the intermittent bug).
+        // restore the giant size (the intermittent bug). Also skipped while
+        // the view morph drives the boxes.
         if (!info.isLayer && info.window &&
             g_fsPhase == EFullscreenPhase::None && g_fsAssertFrames == 0 &&
+            g_viewMorph == EViewMorph::None &&
             info.id != g_fsCurrentId) // a fullscreened window's box is the
                                       // monitor -- transient, never "stable"
             g_fsStableBoxes[info.id] = Compat::currentWindowBox(info.window);
@@ -1418,13 +1497,22 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.spawnScale = WIN_SCALE;
 
         // Seed pose: existing entities own their world position and rotation.
-        // NEW windows spawn straight in front of the camera at a fixed read
-        // distance, facing it.
+        // Next come the poses remembered from the last 3D session -- positions
+        // are per-mode, so the room comes back exactly as it was left. NEW
+        // windows (never dragged, no memory) spawn straight in front of the
+        // camera at a fixed read distance, facing it.
         if (const auto* EXISTING = g_world.find(info.id)) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
+        }
+        else if (const auto POSE = g_savedPoses.find(info.id);
+                 POSE != g_savedPoses.end()) {
+            entity.center = POSE->second.center;
+            entity.yaw    = POSE->second.yaw;
+            entity.pitch  = POSE->second.pitch;
+            entity.roll   = POSE->second.roll;
         }
         else {
             const auto& CAM = g_scene.camera();
@@ -1573,7 +1661,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     // Aim focus updates freeze during the fullscreen transition: the flying
     // quad sweeps the crosshair across other windows and would thrash focus.
-    if (g_fsPhase == EFullscreenPhase::None)
+    // The view morph flies every window at once -- same freeze.
+    if (g_fsPhase == EFullscreenPhase::None && g_viewMorph == EViewMorph::None)
         updateAimFocus(dt);
 }
 
@@ -2158,6 +2247,285 @@ static void applyFullscreenAnimation() {
     }
 }
 
+// --- 2D/3D view morph --------------------------------------------------------
+//
+// The toggle transition. Every window's 2D rectangle (monitor-local, logical
+// px) is back-projected onto the camera frustum plane -- the pose where the
+// quad covers its on-screen spot exactly, the fullscreen passthrough's
+// construction generalized to every window. Entering 3D, the quads take off
+// from those poses and fly to the room poses while the environment fades in
+// per-pixel; leaving 3D reverses it. Windows whose 2D box differs from the
+// room box (tiled windows force-floated by the ghosting) animate their REAL
+// box along the way, so the client re-renders mid-flight and the content
+// inside the quad never jumps scale -- the same trick the fullscreen
+// transition uses for its restore box.
+
+static CBox viewMorphLocalBox(const PHLMONITOR& mon, const CBox& global) {
+    return CBox{
+        global.x - mon->m_position.x,
+        global.y - mon->m_position.y,
+        global.w,
+        global.h,
+    };
+}
+
+static CBox lerpBox(const CBox& A, const CBox& B, float t) {
+    return CBox{
+        A.x + (B.x - A.x) * t,
+        A.y + (B.y - A.y) * t,
+        A.w + (B.w - A.w) * t,
+        A.h + (B.h - A.h) * t,
+    };
+}
+
+static bool boxesDiffer(const CBox& A, const CBox& B) {
+    return std::fabs(A.x - B.x) > 0.5 || std::fabs(A.y - B.y) > 0.5 ||
+        std::fabs(A.w - B.w) > 0.5 || std::fabs(A.h - B.h) > 0.5;
+}
+
+// Entered 3D: the pre-ghost snapshots exist (serviceCapture captured them
+// before the ghosting), so the takeoff endpoints are known: box2D from the
+// snapshot (the 2D look), boxRoom from the post-ghost real box, room poses
+// from the saved memory (or the fresh spawn in front of the camera).
+static void buildEnterMorph(
+    const PHLMONITOR& mon, const std::vector<Compat::SWindowInfo>& infos) {
+    g_viewMorphWins.clear();
+
+    const auto& CAM = g_scene.camera();
+    const Vec3  FWD = CAM.forward();
+
+    int i = 0;
+
+    for (const auto& info : infos) {
+        SViewMorphWin MW;
+
+        const auto* SNAPSHOT = g_capture.get(info.id);
+
+        MW.box2D = SNAPSHOT ? SNAPSHOT->sampledBox : info.monitorLocalBox;
+        MW.boxRoom = MW.box2D;
+
+        if (info.window)
+            MW.boxRoom = viewMorphLocalBox(
+                mon, Compat::currentWindowBox(info.window));
+
+        MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
+
+        if (const auto POSE = g_savedPoses.find(info.id);
+            POSE != g_savedPoses.end()) {
+            MW.roomPose = POSE->second;
+        } else {
+            // The same fresh spawn syncWorld seeds for unknown windows.
+            MW.roomPose.center = CAM.position + FWD * g_cfgSpawnDistance;
+            MW.roomPose.yaw    = std::atan2(-FWD.x, -FWD.z);
+            MW.roomPose.pitch  = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
+            MW.roomPose.roll   = 0.0f;
+        }
+
+        MW.stack = static_cast<float>(i) * kMorphStackEps;
+        ++i;
+
+        g_viewMorphWins[info.id] = MW;
+    }
+
+    g_viewMorph = EViewMorph::To3D;
+}
+
+// Leaving 3D: freeze the room poses into the saved memory (a mid-flight
+// enter morph contributes its intended room pose, not the flight), then
+// aim every quad at the rectangle the 2D desktop is about to show: the live
+// floating box for floating windows, the saved tile box for tiled ones.
+static void beginExit3D() {
+    if (!g_active)
+        return;
+
+    resetPointerGesture();
+
+    // No morph through fullscreen passthrough phases: the legacy fade runs.
+    const auto MON = targetMonitor();
+
+    if (g_fsPhase != EFullscreenPhase::None || !MON)
+        return;
+
+    const auto INFOS = Compat::enumerateEligibleWindows(MON);
+
+    // An interrupted ENTER morph contributes its intended room poses.
+    const auto PREVIOUS = std::move(g_viewMorphWins);
+
+    g_savedPoses.clear();
+    g_viewMorphWins.clear();
+
+    int i = 0;
+
+    for (const auto& ENTITY : g_world.entities()) {
+        SViewMorphWin MW;
+
+        const auto* SNAPSHOT = g_capture.get(ENTITY.id);
+
+        MW.boxRoom = SNAPSHOT ?
+            SNAPSHOT->sampledBox :
+            CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
+                 ENTITY.logicalWidth, ENTITY.logicalHeight};
+
+        // The intended room pose: mid-flight exits keep the destination.
+        if (auto POSE = PREVIOUS.find(ENTITY.id); POSE != PREVIOUS.end()) {
+            MW.roomPose = POSE->second.roomPose;
+        } else {
+            MW.roomPose = SViewPose{
+                ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
+        }
+
+        g_savedPoses[ENTITY.id] = MW.roomPose;
+
+        // The 2D restore box.
+        MW.box2D   = MW.boxRoom;
+        MW.animBox = false;
+
+        for (const auto& info : INFOS) {
+            if (info.id != ENTITY.id || !info.window)
+                continue;
+
+            const CBox CUR = viewMorphLocalBox(
+                MON, Compat::currentWindowBox(info.window));
+
+            for (const auto& SAVE : g_layoutSaves) {
+                if (SAVE.id != ENTITY.id)
+                    continue;
+
+                MW.box2D = SAVE.wasFloating ?
+                    CUR : viewMorphLocalBox(MON, SAVE.box);
+
+                MW.animBox = boxesDiffer(MW.box2D, MW.boxRoom);
+
+                break;
+            }
+
+            break;
+        }
+
+        MW.stack = static_cast<float>(i) * kMorphStackEps;
+        ++i;
+
+        g_viewMorphWins[ENTITY.id] = MW;
+    }
+
+    g_viewMorph = EViewMorph::To2D;
+}
+
+// One morph frame: quad pose = lerp(screen pose of the current snapshot box,
+// room pose, s); size lerp(1:1, config scale, s); the real box follows the
+// same s for animBox windows. Written into BOTH the render entry (zero lag)
+// and the entity (picking + next frame's reseed agree with the render).
+static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
+    if (!mon)
+        return;
+
+    const auto& CAM = g_scene.camera();
+
+    for (auto& RW : g_renderWindows) {
+        const auto MWIT = g_viewMorphWins.find(RW.id);
+
+        if (MWIT == g_viewMorphWins.end())
+            continue;
+
+        const SViewMorphWin& MW = MWIT->second;
+
+        World3D::SEntity* E = g_world.find(RW.id);
+
+        if (!E)
+            continue;
+
+        // The box whose content the snapshot shows NOW. The real box driven
+        // below reaches the snapshot one capture later -- the same one-frame
+        // lag the fullscreen transition lives with.
+        const auto* SNAPSHOT = g_capture.get(RW.id);
+        const CBox  BOX =
+            SNAPSHOT ? SNAPSHOT->sampledBox : MW.boxRoom;
+
+        if (MW.animBox) {
+            if (auto W = Compat::findWindowById(RW.id)) {
+                const CBox TARGET = lerpBox(MW.box2D, MW.boxRoom, s);
+
+                Compat::setWindowBox(
+                    W,
+                    CBox{TARGET.x + mon->m_position.x,
+                         TARGET.y + mon->m_position.y, TARGET.w, TARGET.h});
+            }
+        }
+
+        // Exact 1:1 on the frustum plane at s=0, the room scale at s=1.
+        const float SCALE = 1.0f + (configWindowScale() - 1.0f) * s;
+
+        const auto SP = ScreenProject::project(
+            CAM.position, CAM.yaw, CAM.pitch, CAM.mirrorView, g_scene.zoom(),
+            kFovDeg * (3.14159265f / 180.0f), mon->m_size.x, mon->m_size.y,
+            BOX.x + BOX.w * 0.5f, BOX.y + BOX.h * 0.5f, MW.stack);
+
+        const Vec3 C = SP.center + (MW.roomPose.center - SP.center) * s;
+
+        RW.x = C.x;
+        RW.y = C.y;
+        RW.z = C.z;
+        RW.yaw   = SP.yaw + wrapPi(MW.roomPose.yaw - SP.yaw) * s;
+        RW.pitch = SP.pitch + (MW.roomPose.pitch - SP.pitch) * s;
+        RW.roll  = MW.roomPose.roll * s;
+
+        RW.width  = ScreenProject::widthWorld(BOX.w) * SCALE;
+        RW.height = ScreenProject::heightWorld(BOX.h) * SCALE;
+
+        E->center = C;
+        E->yaw    = RW.yaw;
+        E->pitch  = RW.pitch;
+        E->roll   = RW.roll;
+        E->width  = RW.width;
+        E->height = RW.height;
+    }
+}
+
+static void applyViewMorph(const PHLMONITOR& mon) {
+    if (g_viewMorph == EViewMorph::None) {
+        g_morphS = 1.0f;
+        g_scene.setEnvAlpha(1.0f);
+        return;
+    }
+
+    if (g_fsPhase != EFullscreenPhase::None) {
+        // The passthrough owns the screen the moment it starts: land the
+        // morph instantly at its endpoint and step aside.
+        const float S_END = g_viewMorph == EViewMorph::To3D ? 1.0f : 0.0f;
+
+        g_morphS = S_END;
+        g_scene.setEnvAlpha(S_END);
+        applyViewMorphWindows(mon, S_END);
+
+        g_viewMorph = EViewMorph::None;
+        g_viewMorphWins.clear();
+        return;
+    }
+
+    const float RAW = std::clamp(g_transition, 0.0f, 1.0f);
+
+    g_morphS = RAW * RAW * (3.0f - 2.0f * RAW);
+    g_scene.setEnvAlpha(g_morphS);
+
+    applyViewMorphWindows(mon, g_morphS);
+
+    // The enter morph ends with the transition; the exit morph ends when
+    // the transition drains to zero (deactivate3D resets the state).
+    if (g_transitionTarget > 0.5f && g_transition >= 1.0f) {
+        g_viewMorph = EViewMorph::None;
+        g_viewMorphWins.clear();
+    }
+}
+
+// Remember the room as it is right now; prunes windows that no longer exist.
+static void saveViewPoses() {
+    g_savedPoses.clear();
+
+    for (const auto& E : g_world.entities())
+        g_savedPoses[E.id] =
+            SViewPose{E.center, E.yaw, E.pitch, E.roll};
+}
+
 // Ends a model roll gesture: restores the suspended gravity on every exit
 // path (button release, crosshair leaving, model vanishing) and WAKES the
 // body -- during the roll it was held motionless, so Jolt put it to sleep,
@@ -2425,6 +2793,17 @@ static void deactivate3D() {
     g_active = false;
     stopFramePump();
 
+    // Positions are per-mode: remember the room as it was for the next
+    // session -- unless the exit morph already saved the poses (the entity
+    // poses are at the screen endpoints by now).
+    if (g_viewMorph != EViewMorph::To2D)
+        saveViewPoses();
+
+    g_viewMorph       = EViewMorph::None;
+    g_viewMorphArmed  = false;
+    g_viewMorphWins.clear();
+    g_morphS = 1.0f;
+
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
     // monitor-sized). The SIZE is the spawn size -- never the possibly
@@ -2514,6 +2893,14 @@ static void enter3D() {
     g_world.clear();
     g_renderWindows.clear();
 
+    // The view morph arms here but builds on the first capture pass, AFTER
+    // the pre-ghost snapshots exist (see serviceCapture). Poses remembered
+    // by the previous session survive: positions are per-mode.
+    g_viewMorph       = EViewMorph::None;
+    g_viewMorphWins.clear();
+    g_viewMorphArmed  = true;
+    g_morphS          = 0.0f;
+
     // Player spawn point (config player_spawn): the coordinates are the
     // player's FEET, so spawning at 0,0,0 stands on the grid platform at
     // world zero instead of falling through it. Eyes ride kEyeHeight above.
@@ -2584,6 +2971,8 @@ static void toggle3D() {
 
     if (g_transitionTarget > 0.5f)
         enter3D();
+    else
+        beginExit3D();
 
     damageCurrentMonitor();
 
@@ -2606,6 +2995,7 @@ static void open3D() {
 
 static void close3D() {
     g_transitionTarget = 0.0f;
+    beginExit3D();
     damageCurrentMonitor();
 
     notify(
@@ -3057,7 +3447,8 @@ static void update3D(float dt) {
         const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
                                           s_moveVel.z * s_moveVel.z);
         const bool BOBING = g_cfgWalkBob && !g_playerFlying && g_grounded &&
-            g_fsPhase == EFullscreenPhase::None && g_viewMode == 0;
+            g_fsPhase == EFullscreenPhase::None &&
+            g_viewMorph == EViewMorph::None && g_viewMode == 0;
         const float TARGET_AMP =
             BOBING ? kBobAmplitude *
                 std::min(1.0f, BOB_SPEED / std::max(CAM.moveSpeed, 0.5f))
@@ -3224,10 +3615,18 @@ static void update3D(float dt) {
 
     applyFullscreenAnimation();
 
+    // The 2D<->3D view morph: runs after syncWorld and overrides the quad
+    // poses (same slot the fullscreen animation occupies -- the two never
+    // run together, applyViewMorph lands instantly when a FS phase starts).
+    applyViewMorph(MON);
+
     // Normal client interaction is a virtual pointer located exactly at the
     // crosshair. It is updated every frame after camera motion, so buttons,
     // text fields, scrollbars, etc. receive ordinary Wayland pointer motion.
-    if (!g_pointerDown && g_fsPhase == EFullscreenPhase::None)
+    // Frozen during transitions: the flying quads sweep the crosshair across
+    // whatever sits behind them.
+    if (!g_pointerDown && g_fsPhase == EFullscreenPhase::None &&
+        g_viewMorph == EViewMorph::None)
         forwardPointerToAim(inputTimeMs());
 }
 
@@ -3426,6 +3825,10 @@ static void dumpStatus() {
         << " transition=" << g_transition
         << " target=" << g_transitionTarget
         << " alphaSent=" << g_diagAlpha
+        << " morph=" << static_cast<int>(g_viewMorph)
+        << " morphS=" << g_morphS
+        << " morphWins=" << g_viewMorphWins.size()
+        << " savedPoses=" << g_savedPoses.size()
         << " renderedOnce=" << (g_renderedOnce ? 1 : 0) << "\n";
 
     out << "hookInstalled=" << (g_hookInstalled ? 1 : 0)
@@ -3611,7 +4014,14 @@ static void onRenderStage(eRenderStage stage) {
 
     if (g_transition <= 0.0f && g_transitionTarget <= 0.0f) {
         requestDeactivate3D();
-        return;
+
+        // No morph running: nothing covers the desktop, stop rendering.
+        if (g_viewMorph == EViewMorph::None)
+            return;
+
+        // The exit morph just drained: draw ONE more frame at s=0 -- the
+        // quads sit exactly on the 2D rectangles and cover the gap until
+        // the deferred teardown restores the real windows.
     }
 
     if (!g_pHyprRenderer)
@@ -3631,7 +4041,11 @@ static void onRenderStage(eRenderStage stage) {
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - U3_T0).count() * 0.1;
 
-    g_diagAlpha = std::clamp(g_transition, 0.0f, 1.0f);
+    // Composite alpha: the view morph needs the scene opaque from its first
+    // frame (the windows land exactly on the 2D rectangles; the environment
+    // fades per-pixel inside the scene instead). The fullscreen passthrough
+    // keeps its own minimal handoff fades.
+    g_diagAlpha = 1.0f;
 
     if (g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D)
         g_diagAlpha = g_fsAlpha;
@@ -5136,6 +5550,15 @@ APICALL EXPORT void PLUGIN_EXIT() {
         g_pHyprRenderer->setCursorFromName("default", true);
 
     clearAimFocus();
+
+    // Positions are per-mode: keep the room's last known arrangement for the
+    // next load -- unless an exit morph is mid-flight (the entity poses are
+    // already at the screen endpoints; beginExit3D saved the room poses).
+    if (g_viewMorph != EViewMorph::To2D)
+        saveViewPoses();
+    g_viewMorph      = EViewMorph::None;
+    g_viewMorphArmed = false;
+    g_viewMorphWins.clear();
 
     g_world.clear();
     g_renderWindows.clear();

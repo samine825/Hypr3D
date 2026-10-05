@@ -419,15 +419,22 @@ in vec2 vUV;
 
 uniform sampler2D uTexture;
 uniform int uTextured;
+uniform int uPremult;
 uniform vec4 uColor;
 
 out vec4 fragColor;
 
 void main() {
-    if (uTextured != 0)
-        fragColor = texture(uTexture, vUV) * uColor;
+    vec4 c = uTextured != 0 ? texture(uTexture, vUV) * uColor : uColor;
+
+    // Premultiplied mode (the 2D<->3D view morph): the scene buffer holds
+    // color-already-multiplied-by-alpha, so the composite can stack the
+    // environment and the window quads with (ONE, ONE_MINUS_SRC_ALPHA)
+    // and the desktop shows through exactly where alpha is 0.
+    if (uPremult != 0)
+        fragColor = vec4(c.rgb * c.a, c.a);
     else
-        fragColor = uColor;
+        fragColor = c;
 }
 )GLSL";
 
@@ -459,6 +466,7 @@ in vec2 vUV;
 
 uniform sampler2D uTexture;
 uniform float uAlpha;
+uniform int uPerPx;
 
 out vec4 fragColor;
 
@@ -479,13 +487,20 @@ void main() {
         uv
     );
 
-    // The scene itself is opaque. uAlpha is only the 2D->3D transition; it
-    // must not be multiplied by per-pixel scene alpha left behind by grid or
-    // window texture blending.
-    fragColor = vec4(
-        color.rgb,
-        uAlpha
-    );
+    if (uPerPx != 0) {
+        // The scene buffer holds a premultiplied image (the view morph's
+        // per-pixel environment fade); composite it as such. uAlpha rides
+        // both channels so a caller-side fade stays available.
+        fragColor = color * uAlpha;
+    } else {
+        // The scene itself is opaque. uAlpha is only the 2D->3D transition; it
+        // must not be multiplied by per-pixel scene alpha left behind by grid or
+        // window texture blending.
+        fragColor = vec4(
+            color.rgb,
+            uAlpha
+        );
+    }
 }
 )GLSL";
 
@@ -669,6 +684,12 @@ void main() {
             "uUVRect"
         );
 
+    m_scenePremult =
+        glGetUniformLocation(
+            m_sceneProgram,
+            "uPremult"
+        );
+
     m_blitTexture =
         glGetUniformLocation(
             m_blitProgram,
@@ -679,6 +700,12 @@ void main() {
         glGetUniformLocation(
             m_blitProgram,
             "uAlpha"
+        );
+
+    m_blitPerPx =
+        glGetUniformLocation(
+            m_blitProgram,
+            "uPerPx"
         );
 
     m_panoramaFwd =
@@ -729,8 +756,10 @@ void main() {
         m_sceneTextured >= 0 &&
         m_sceneColorUniform >= 0 &&
         m_sceneUVRect >= 0 &&
+        m_scenePremult >= 0 &&
         m_blitTexture >= 0 &&
         m_blitAlpha >= 0 &&
+        m_blitPerPx >= 0 &&
         m_panoramaFwd >= 0 &&
         m_panoramaRight >= 0 &&
         m_panoramaUp >= 0 &&
@@ -1763,14 +1792,24 @@ void GLScene::drawWindows(
     glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, vp.m.data());
     glUniform4f(m_sceneUVRect, 0.f, 0.f, 1.f, 1.f);
     glUniform1i(m_sceneTexture, 0);
+    // Premultiplied mode (the view morph): color is stored already scaled
+    // by alpha, and the alpha channel accumulates -- the composite then
+    // stacks windows and environment in one consistent convention.
+    glUniform1i(m_scenePremult, m_windowsPremultiplied ? 1 : 0);
 
     glEnable(GL_DEPTH_TEST);
     glDepthMask(GL_TRUE);
     glEnable(GL_BLEND);
-    glBlendFuncSeparate(
-        GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
-        GL_ZERO, GL_ONE
-    );
+    if (m_windowsPremultiplied)
+        glBlendFuncSeparate(
+            GL_ONE, GL_ONE_MINUS_SRC_ALPHA,
+            GL_ONE, GL_ONE_MINUS_SRC_ALPHA
+        );
+    else
+        glBlendFuncSeparate(
+            GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA,
+            GL_ZERO, GL_ONE
+        );
 
     glBindVertexArray(m_polyVAO);
     glBindBuffer(GL_ARRAY_BUFFER, m_polyVBO);
@@ -1908,7 +1947,8 @@ void GLScene::drawCrosshair(int width, int height) {
 }
 
 void GLScene::drawFullscreen(
-    float alpha
+    float alpha,
+    bool perPixel
 ) {
     glUseProgram(m_blitProgram);
 
@@ -1917,6 +1957,7 @@ void GLScene::drawFullscreen(
 
     glUniform1i(m_blitTexture, 0);
     glUniform1f(m_blitAlpha, alpha);
+    glUniform1i(m_blitPerPx, perPixel ? 1 : 0);
 
     glBindVertexArray(m_fullscreenVAO);
 
@@ -1925,6 +1966,54 @@ void GLScene::drawFullscreen(
     glBindVertexArray(0);
 
     glBindTexture(GL_TEXTURE_2D, 0);
+}
+
+// The environment fade (the view morph): one NDC quad in the scene program's
+// layout, drawn with (GL_ZERO, GL_SRC_COLOR) -- it scales the rgba already
+// sitting in the scene buffer by `a`, turning the opaque room image into its
+// premultiplied faded form in place. Color and alpha scale together, so the
+// later premultiplied composite shows the desktop through at exactly (1 - a).
+void GLScene::drawEnvFade(float a) {
+    if (!m_fadeVAO) {
+        glGenVertexArrays(1, &m_fadeVAO);
+        glGenBuffers(1, &m_fadeVBO);
+
+        const float verts[] = {
+            // pos(3) + uv(2), NDC fullscreen triangle pair
+            -1.f, -1.f, 0.f, 0.f, 0.f,
+             1.f, -1.f, 0.f, 0.f, 0.f,
+             1.f,  1.f, 0.f, 0.f, 0.f,
+            -1.f, -1.f, 0.f, 0.f, 0.f,
+             1.f,  1.f, 0.f, 0.f, 0.f,
+            -1.f,  1.f, 0.f, 0.f, 0.f,
+        };
+
+        glBindVertexArray(m_fadeVAO);
+        glBindBuffer(GL_ARRAY_BUFFER, m_fadeVBO);
+        glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts,
+                     GL_STATIC_DRAW);
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+    }
+
+    glUseProgram(m_sceneProgram);
+
+    const Mat4 IDENTITY = Mat4::identity();
+    glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
+    glUniform1i(m_sceneTextured, 0);
+    glUniform1i(m_scenePremult, 0);
+    glUniform4f(m_sceneColorUniform, a, a, a, a);
+    glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
+
+    glBindVertexArray(m_fadeVAO);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    glBindVertexArray(0);
 }
 
 void GLScene::requestProbe() {
@@ -2154,6 +2243,18 @@ bool GLScene::render(
     // The desktop underneath is left exactly as Hyprland drew it and simply
     // fades out via `alpha`. It is never copied or re-projected, so the
     // workspace never appears as an object inside the 3D world.
+    //
+    // MORPH (the 2D<->3D view morph, envAlpha < 1) switches the buffer to a
+    // premultiplied per-pixel image: transparent clear, everything drawn so
+    // far (panorama, map, floor, grid, player) multiplied by envAlpha in
+    // place, window quads composited premultiplied on top at full alpha.
+    // At envAlpha 0 the scene is windows only -- projected onto their 2D
+    // rectangles they replace the desktop pixels 1:1, no fade at either
+    // handoff; as envAlpha rises the room materializes behind the flying
+    // windows.
+    const bool MORPH = m_envAlpha < 0.999f;
+
+    m_windowsPremultiplied = MORPH;
 
     glBindFramebuffer(GL_FRAMEBUFFER, m_sceneFBO);
 
@@ -2167,7 +2268,10 @@ bool GLScene::render(
     glDepthFunc(GL_LESS);
     glDepthMask(GL_TRUE);
 
-    glClearColor(0.012f, 0.019f, 0.032f, 1.0f);
+    if (MORPH)
+        glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+    else
+        glClearColor(0.012f, 0.019f, 0.032f, 1.0f);
 
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
@@ -2231,9 +2335,32 @@ bool GLScene::render(
         drawGrid(vp);
     }
 
+    // MORPH: multiply everything drawn so far by the environment alpha.
+    // (GL_ZERO, GL_SRC_COLOR) scales dst by the quad's rgba in place --
+    // an opaque environment (alpha 1) becomes exactly (rgb * a, a), the
+    // premultiplied representation of the room faded to `a`. Windows draw
+    // after this and keep their own alpha, so they never dim.
+    if (MORPH) {
+        glDepthMask(GL_FALSE);
+        glDisable(GL_DEPTH_TEST);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_ZERO, GL_SRC_COLOR);
+
+        drawEnvFade(m_envAlpha);
+
+        glEnable(GL_DEPTH_TEST);
+        glDepthMask(GL_TRUE);
+    }
+
     // Windows submit back to front and write depth: crossing quads cut into
     // each other honestly, and translucency composites in order.
     drawWindows(vp, windows);
+
+    m_windowsPremultiplied = false;
+
+    // Everything after the windows (F3 HUD text) draws straight again.
+    glUseProgram(m_sceneProgram);
+    glUniform1i(m_scenePremult, 0);
 
     glDepthMask(GL_TRUE);
 
@@ -2269,14 +2396,26 @@ bool GLScene::render(
     glDisable(GL_SCISSOR_TEST);
     glEnable(GL_BLEND);
 
-    glBlendFuncSeparate(
-        GL_SRC_ALPHA,
-        GL_ONE_MINUS_SRC_ALPHA,
-        GL_ONE,
-        GL_ONE_MINUS_SRC_ALPHA
-    );
+    if (MORPH) {
+        // The scene buffer holds a premultiplied image: composite it as
+        // such so the desktop shows through exactly where the environment
+        // faded out, and window pixels (alpha 1) replace it outright.
+        glBlendFuncSeparate(
+            GL_ONE,
+            GL_ONE_MINUS_SRC_ALPHA,
+            GL_ONE,
+            GL_ONE_MINUS_SRC_ALPHA
+        );
+    } else {
+        glBlendFuncSeparate(
+            GL_SRC_ALPHA,
+            GL_ONE_MINUS_SRC_ALPHA,
+            GL_ONE,
+            GL_ONE_MINUS_SRC_ALPHA
+        );
+    }
 
-    drawFullscreen(std::clamp(alpha, 0.0f, 1.0f));
+    drawFullscreen(std::clamp(alpha, 0.0f, 1.0f), MORPH);
     drawCrosshair(width, height);
 
     // --- restore compositor state ---
@@ -2443,6 +2582,16 @@ void GLScene::destroyGLObjects() {
     if (m_fullscreenVAO) {
         glDeleteVertexArrays(1, &m_fullscreenVAO);
         m_fullscreenVAO = 0;
+    }
+
+    if (m_fadeVBO) {
+        glDeleteBuffers(1, &m_fadeVBO);
+        m_fadeVBO = 0;
+    }
+
+    if (m_fadeVAO) {
+        glDeleteVertexArrays(1, &m_fadeVAO);
+        m_fadeVAO = 0;
     }
 
     if (m_gridVBO) {

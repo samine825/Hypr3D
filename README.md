@@ -51,6 +51,28 @@ Or bind in lua config:
 hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 ```
 
+## Independent 2D / 3D positions
+
+Window positions are per-mode. The 2D desktop keeps its own layout: ghosting
+saves every window's geometry on entry and restores it exactly on exit, and
+dragging or resizing a window inside the room never disturbs it (a floating
+window keeps a 3D resize, a tiled one returns to its tile). The room, in
+turn, remembers where every window was dragged: on the next toggle each
+window comes back to its own 3D spot instead of spawning at the default
+place in front of you.
+
+The toggle itself is not a fade. Every window's 2D rectangle is
+back-projected onto the camera frustum plane -- the pose where the quad
+covers its on-screen spot exactly (the same construction the fullscreen
+passthrough uses) -- and the quads take off from there and fly to their
+room poses while the room itself materializes around them; leaving 3D
+reverses it. Neither handoff shows a jump: on entry the first 3D frame is
+pixel-identical to the 2D desktop, and on exit the last 3D frame is
+pixel-identical to what the compositor is about to show. Windows whose 2D
+box differs from their room box (tiled windows, which the ghosting
+force-floats) animate their real box along the way, so the client re-renders
+mid-flight and the content never pops scale.
+
 ## Controls
 
 | Input                         | Action                                         |

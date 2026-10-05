@@ -6,6 +6,7 @@
 #include "World/Outline.hpp"
 #include "World/Picking.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -112,6 +113,20 @@ class GLScene {
     // symmetrically around the crosshair, so aiming stays exact.
     void setZoom(float magnification) {
         m_zoom = magnification > 0.01f ? magnification : 0.01f;
+    }
+
+    float zoom() const {
+        return m_zoom;
+    }
+
+    // Environment visibility for the 2D<->3D view morph: 1 = the room fully
+    // drawn (steady state), 0 = windows only over a transparent scene
+    // buffer (the 2D desktop beneath shows through everywhere the window
+    // quads do not cover). While below 1 the scene pass switches to a
+    // premultiplied per-pixel composite: the environment fades as one, the
+    // window quads stay fully opaque from the first morph frame.
+    void setEnvAlpha(float a) {
+        m_envAlpha = std::clamp(a, 0.0f, 1.0f);
     }
 
     // The player's own character (player.mesh). The SAME mesh description
@@ -233,8 +248,12 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
-    void drawFullscreen(float alpha);
+    void drawFullscreen(float alpha, bool perPixel);
     void drawCrosshair(int width, int height);
+
+    // Fullscreen NDC quad in the SCENE program's layout (pos3+uv2): the
+    // environment fade multiplies the scene buffer in place.
+    void drawEnvFade(float a);
 
   private:
     bool m_initialized = false;
@@ -272,6 +291,9 @@ class GLScene {
     unsigned int m_fullscreenVAO = 0;
     unsigned int m_fullscreenVBO = 0;
 
+    unsigned int m_fadeVAO = 0;
+    unsigned int m_fadeVBO = 0;
+
     unsigned int m_crosshairVAO = 0;
     unsigned int m_crosshairVBO = 0;
 
@@ -280,9 +302,11 @@ class GLScene {
     int m_sceneTextured = -1;
     int m_sceneColorUniform = -1;
     int m_sceneUVRect = -1;
+    int m_scenePremult = -1;
 
     int m_blitTexture = -1;
     int m_blitAlpha = -1;
+    int m_blitPerPx = -1;
 
     int m_panoramaFwd = -1;
     int m_panoramaRight = -1;
@@ -306,6 +330,11 @@ class GLScene {
     Camera m_camera;
 
     float m_time = 0.0f;
+
+    // 2D<->3D view morph: environment visibility (1 = steady room) and the
+    // window pipeline mode it selects. See setEnvAlpha.
+    float m_envAlpha = 1.0f;
+    bool  m_windowsPremultiplied = false;
 
     // F3 debug HUD state.
     bool                            m_debugOverlay = false;
