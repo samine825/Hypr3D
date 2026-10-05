@@ -195,27 +195,46 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     // state takes the space->move() branch (the ghosted target was never a
     // member of its space, but HAD_SPACE reads true from the ghost
     // pointer), and the layout algorithm learns nothing from a moveTarget()
-    // of a window it does not know -- the window then never re-tiles: it
-    // stays floating wherever the session left it, unmanaged, keeping the
-    // 3D-session box (the "frozen third state" and the size leak). With the
-    // ghost cleared first, HAD_SPACE is false and the space->add() branch
-    // runs, which properly inserts the target into the layout algorithm.
+    // of a window it does not know. With the ghost cleared first, HAD_SPACE
+    // is false and the space->add() branch runs, which properly inserts the
+    // target into the layout algorithm.
     WINDOW->m_target->setSpaceGhost(nullptr);
 
-    // Put the target back into its space while it is still floating. For a
-    // window that was floating before 3D, retain the real box produced by the
-    // 3D resize. Tiled windows deliberately return to their original layout.
-    const CBox RESTORE_BOX = save.wasFloating ? WINDOW->m_target->position() : save.box;
+    // The exact box the window had when 3D was entered -- for floating
+    // windows too: sizes are per-mode, and a 3D resize must not survive
+    // into 2D (the exit morph animates the real box back to this one).
+    const CBox RESTORE_BOX = save.box;
 
     if (save.space)
         WINDOW->m_target->assignToSpace(save.space);
     else
         WINDOW->m_target->assignToSpace(nullptr); // force-clear the ghost flag
 
-    WINDOW->m_target->setFloating(true);
-    WINDOW->m_target->setPositionGlobal(RESTORE_BOX);
-    WINDOW->m_target->rememberFloatingSize(Vector2D{RESTORE_BOX.w, RESTORE_BOX.h});
-    WINDOW->m_target->setFloating(save.wasFloating);
+    if (save.wasFloating) {
+        WINDOW->m_target->setPositionGlobal(RESTORE_BOX);
+        WINDOW->m_target->rememberFloatingSize(
+            Vector2D{RESTORE_BOX.w, RESTORE_BOX.h});
+    } else {
+        // The canonical float->tile transition. The bare
+        // m_target->setFloating(false) only flips the flag and notifies
+        // rules -- the layout algorithm's own floating-target bookkeeping
+        // never hears about it, and the window ends up positioned but
+        // unmanaged: frozen outside the layout until the next interaction
+        // adopts it. CSpace::toggleTargetFloating is what Hyprland's own
+        // changeFloatingMode calls; it routes through
+        // CAlgorithm::setFloating (remove + re-insert by the new state).
+        if (save.space)
+            save.space->toggleTargetFloating(WINDOW->m_target);
+        else
+            WINDOW->m_target->setFloating(false);
+
+        // Pin the exact pre-3D tile box on top of the algorithm's
+        // arrangement (same insertion order reproduces the same layout;
+        // this covers the corner cases).
+        WINDOW->m_target->setPositionGlobal(RESTORE_BOX);
+        WINDOW->m_target->rememberFloatingSize(
+            Vector2D{RESTORE_BOX.w, RESTORE_BOX.h});
+    }
 
     g_pHyprRenderer->damageWindow(WINDOW);
 }

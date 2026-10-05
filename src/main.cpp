@@ -133,6 +133,11 @@ struct SViewPose {
     float yaw   = 0.f;
     float pitch = 0.f;
     float roll  = 0.f;
+
+    // The room-content box (monitor-local px): sizes are per-mode too, so
+    // the window's real box is driven back to this on the next entry (and
+    // to the 2D box on exit). Empty = never sized in the room.
+    CBox box{};
 };
 
 // Room poses remembered across toggles; keyed by window id, pruned against
@@ -2332,11 +2337,20 @@ static void buildEnterMorph(
             MW.boxRoom = viewMorphLocalBox(
                 mon, Compat::currentWindowBox(info.window));
 
-        MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
-
         if (const auto POSE = g_savedPoses.find(info.id);
             POSE != g_savedPoses.end()) {
             MW.roomPose = POSE->second;
+
+            // Sizes are per-mode: the room keeps the box the window had
+            // here last time. The real box (and with it the content
+            // resolution) is driven there by the morph; the position stays
+            // wherever the ghosting put it -- only the size matters.
+            if (info.window && MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0) {
+                const CBox CUR = viewMorphLocalBox(
+                    mon, Compat::currentWindowBox(info.window));
+                MW.boxRoom = CBox{CUR.x, CUR.y,
+                                  MW.roomPose.box.w, MW.roomPose.box.h};
+            }
         } else {
             // The same fresh spawn syncWorld seeds for unknown windows.
             MW.roomPose.center = CAM.position + FWD * g_cfgSpawnDistance;
@@ -2344,6 +2358,8 @@ static void buildEnterMorph(
             MW.roomPose.pitch  = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
             MW.roomPose.roll   = 0.0f;
         }
+
+        MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
 
         MW.stack = static_cast<float>(i) * kMorphStackEps;
         ++i;
@@ -2398,9 +2414,16 @@ static void beginExit3D() {
                 ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
         }
 
+        // Sizes are per-mode: the room-content box rides the memory, and
+        // the next entry drives the real box back to it.
+        MW.roomPose.box = MW.boxRoom;
+
         g_savedPoses[ENTITY.id] = MW.roomPose;
 
-        // The 2D restore box.
+        // The 2D box the window must land on: the one it had when 3D was
+        // entered -- for FLOATING windows too. A 3D resize is a 3D resize;
+        // the exit morph animates the real box back, so the desktop keeps
+        // its own sizes exactly.
         MW.box2D   = MW.boxRoom;
         MW.animBox = false;
 
@@ -2408,15 +2431,11 @@ static void beginExit3D() {
             if (info.id != ENTITY.id || !info.window)
                 continue;
 
-            const CBox CUR = viewMorphLocalBox(
-                MON, Compat::currentWindowBox(info.window));
-
             for (const auto& SAVE : g_layoutSaves) {
                 if (SAVE.id != ENTITY.id)
                     continue;
 
-                MW.box2D = SAVE.wasFloating ?
-                    CUR : viewMorphLocalBox(MON, SAVE.box);
+                MW.box2D = viewMorphLocalBox(MON, SAVE.box);
 
                 MW.animBox = boxesDiffer(MW.box2D, MW.boxRoom);
 
@@ -2552,9 +2571,11 @@ static void applyViewMorph(const PHLMONITOR& mon) {
 static void saveViewPoses() {
     g_savedPoses.clear();
 
-    for (const auto& E : g_world.entities())
-        g_savedPoses[E.id] =
-            SViewPose{E.center, E.yaw, E.pitch, E.roll};
+    for (const auto& E : g_world.entities()) {
+        SViewPose POSE{E.center, E.yaw, E.pitch, E.roll,
+            CBox{E.logicalLeft, E.logicalTop, E.logicalWidth, E.logicalHeight}};
+        g_savedPoses[E.id] = POSE;
+    }
 }
 
 // Ends a model roll gesture: restores the suspended gravity on every exit
