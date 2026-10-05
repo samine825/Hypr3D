@@ -1876,6 +1876,9 @@ void GLScene::drawWindows(
 // Restored from the pre-unification revision: the black cross with the
 // white outline at the screen centre (screen-space, scene program).
 void GLScene::drawCrosshair(int width, int height) {
+    if (!m_crosshairVisible)
+        return;
+
     if (!m_crosshairVAO || !m_crosshairVBO || width <= 0 || height <= 0)
         return;
 

@@ -390,6 +390,12 @@ enum class EKeyboardMode : uint8_t { Space, Window };
 static EKeyboardMode g_keyboardMode = EKeyboardMode::Space;
 static bool          g_altHeld      = false;
 
+// The free cursor was last seen over the room (see onMouseMove).
+static bool g_freeOnRoom = false;
+
+// A press that switched modes; its release is swallowed too.
+static uint32_t g_swallowRelease = 0;
+
 // Camera movement keys, set only while the 3D view owns the keyboard.
 static bool g_keyFwd = false;
 static bool g_keyBack = false;
@@ -1114,6 +1120,19 @@ static bool ownsInput() {
 
 // Defined with the lifecycle code; the frame pump ends 3D on a session lock.
 static void requestDeactivate3D();
+// Window (typing) mode frees the pointer: the camera freezes, the real cursor
+// comes back and can leave for the other monitors. Space mode captures it
+// again behind the crosshair.
+static bool pointerFree() {
+    return g_keyboardMode == EKeyboardMode::Window;
+}
+
+// Whether a global logical point lies on the monitor the room is drawn on.
+static bool onRoomMonitor(const Vector2D& pos) {
+    const auto MON = targetMonitor();
+
+    return MON && CBox{MON->m_position, MON->m_size}.containsPoint(pos);
+}
 
 static void clearAimFocus() {
     g_aim.reset();
@@ -2278,7 +2297,7 @@ static void startTo3D() {
             g_fsRollAtStart = wrapPi(E->roll);
         }
 
-        if (Compat::setCursorHidden(true))
+        if (!pointerFree() && Compat::setCursorHidden(true))
             Pointer::mgr()->resetCursorImage();
 
         Compat::setPointerCapture(g_hookInstalled);
@@ -3405,6 +3424,9 @@ static void enter3D() {
     g_scene.setPlayerDebugCapsule(Vec3{}, false);
 
     g_keyboardMode = EKeyboardMode::Space;
+    g_scene.setCrosshairVisible(true);
+    g_freeOnRoom     = false;
+    g_swallowRelease = 0;
     g_altHeld      = false;
     s_zoomId       = 0;
 
@@ -3619,7 +3641,7 @@ static void update3D(float dt) {
     // Release capture unconditionally when the view no longer owns input, so
     // a disappearing monitor or a closing transition can never strand the
     // pointer in captured mode.
-    Compat::setPointerCapture(g_hookInstalled && ownsInput());
+    Compat::setPointerCapture(g_hookInstalled && ownsInput() && !pointerFree());
 
     float yawDelta = 0.0f;
     float pitchDelta = 0.0f;
@@ -4209,9 +4231,10 @@ static void update3D(float dt) {
     // crosshair. It is updated every frame after camera motion, so buttons,
     // text fields, scrollbars, etc. receive ordinary Wayland pointer motion.
     // Frozen during transitions: the flying quads sweep the crosshair across
-    // whatever sits behind them.
+    // whatever sits behind them. Typing mode: the pointer drives the plugin's
+    // cursor instead.
     if (!g_pointerDown && g_fsPhase == EFullscreenPhase::None &&
-        g_viewMorph == EViewMorph::None)
+        g_viewMorph == EViewMorph::None && !pointerFree())
         forwardPointerToAim(inputTimeMs());
 }
 
@@ -4709,12 +4732,81 @@ static bool hookSink(double dx, double dy) {
     return onPointerMotion(dx, dy);
 }
 
+static void setKeyboardMode(EKeyboardMode mode) {
+    if (g_keyboardMode == mode)
+        return;
+
+    g_keyboardMode = mode;
+
+    // Both directions start from the crosshair: the cursor appears where the
+    // view was aiming, and returning puts it back on the room monitor (it may
+    // have wandered to another one).
+    Pointer::mgr()->warpTo(crosshairLogical());
+
+    if (pointerFree()) {
+        resetCameraKeys(); // held camera keys must not keep walking
+        resetPointerGesture();
+        g_input.reset(); // drop pending look: the view stops dead
+
+        Compat::setPointerCapture(false);
+        Compat::setCursorHidden(false);
+        Compat::clearPointerFocus();
+
+        if (g_pHyprRenderer)
+            g_pHyprRenderer->setCursorFromName("default", true);
+
+        g_freeOnRoom = true;
+    } else {
+        Compat::setPointerCapture(g_hookInstalled && ownsInput());
+
+        if (Compat::setCursorHidden(true))
+            Pointer::mgr()->resetCursorImage();
+
+        // Hand the keyboard back to the aimed window: another monitor may
+        // have taken focus while the cursor was over there.
+        g_lastFocusId = 0;
+    }
+
+    g_scene.setCrosshairVisible(!pointerFree());
+
+    notify(
+        pointerFree() ?
+            "[hypr3d] typing: free cursor (back button / click the room to return)" :
+            "[hypr3d] moving: wasd / space / shift / ctrl",
+        CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
+    );
+
+    damageCurrentMonitor();
+}
+
 static void onMouseMove(Vector2D pos, Event::SCallbackInfo& info) {
     ++g_diagMoveEvents;
     g_diagLastPos = pos;
 
     if (!ownsInput())
         return;
+
+    if (pointerFree()) {
+        // Over the room, the 2D windows under the cursor are the ghosted
+        // originals the scene hides: keep Hyprland's hover and
+        // focus-follows-mouse off them, so typing stays on the aimed window.
+        // Elsewhere it is the ordinary desktop.
+        const bool ON_ROOM = onRoomMonitor(pos);
+
+        if (ON_ROOM && !g_freeOnRoom) {
+            Compat::clearPointerFocus();
+
+            if (g_pHyprRenderer)
+                g_pHyprRenderer->setCursorFromName("default", true);
+        }
+
+        g_freeOnRoom = ON_ROOM;
+
+        if (ON_ROOM)
+            info.cancelled = true;
+
+        return;
+    }
 
     if (g_hookInstalled && g_diagSinkCalls > 0) {
         // The relative hook already owns the real delta. The absolute event is
@@ -4744,6 +4836,14 @@ static void onMouseAxis(
 ) {
     if (!ownsInput())
         return;
+
+    // Free cursor: scrolling belongs to the desktop, never to the hidden
+    // 2D windows under the room.
+    if (pointerFree()) {
+        if (onRoomMonitor(Pointer::mgr()->position()))
+            info.cancelled = true;
+        return;
+    }
 
     if (event.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
@@ -4915,6 +5015,36 @@ static void onMouseButton(
 
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
+
+    if (!PRESSED && g_swallowRelease == event.button) {
+        g_swallowRelease = 0;
+        info.cancelled = true;
+        return;
+    }
+
+    // The back (thumb) button switches between moving and typing.
+    if (event.button == BTN_BACK) {
+        if (PRESSED) {
+            setKeyboardMode(pointerFree() ? EKeyboardMode::Space :
+                                            EKeyboardMode::Window);
+            g_swallowRelease = BTN_BACK;
+        }
+
+        info.cancelled = true;
+        return;
+    }
+
+    // Free cursor: clicks on other monitors are ordinary desktop clicks. A
+    // press on the room returns to moving and never reaches a client.
+    if (pointerFree()) {
+        if (PRESSED && onRoomMonitor(Pointer::mgr()->position())) {
+            setKeyboardMode(EKeyboardMode::Space);
+            g_swallowRelease = event.button;
+            info.cancelled = true;
+        }
+
+        return;
+    }
 
     // Release the plugin gesture that owns this physical button.
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
@@ -5315,20 +5445,10 @@ static void onKeyboardKey(
 
     if (PRESSED && g_superHeld && g_altHeld &&
         (SYM == XKB_KEY_Alt_L || SYM == XKB_KEY_Super_L)) {
-        g_keyboardMode =
+        setKeyboardMode(
             g_keyboardMode == EKeyboardMode::Space ?
                 EKeyboardMode::Window :
-                EKeyboardMode::Space;
-
-        if (g_keyboardMode == EKeyboardMode::Window)
-            resetCameraKeys(); // held camera keys must not keep walking
-
-        notify(
-            g_keyboardMode == EKeyboardMode::Space ?
-                "[hypr3d] keyboard: space (wasd / space / shift / ctrl)" :
-                "[hypr3d] keyboard: window (typing reaches the focused window)",
-            CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
-        );
+                EKeyboardMode::Space);
 
         info.cancelled = true;
         return;

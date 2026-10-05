@@ -65,7 +65,7 @@ hl.bind("SUPER + F12", hl.plugin.hypr3d.toggle)
 | Super + Right click           | Resize window                                  |
 | Super + Mouse wheel click     | rotate window                                  |
 | Super + Mouse wheel scrolling | Zoom window                                    |
-| Super + Left Alt              | Toggle keyboard mode (movement / window input) |
+| Super + Left Alt / Back button | Toggle typing mode: the view freezes and the cursor is free to use other monitors; click the room to return |
 | F3                            | Toggle debug HUD                               |
 | F5                            | Switch camera view                             |
 
