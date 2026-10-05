@@ -71,7 +71,9 @@ pixel-identical to the 2D desktop, and on exit the last 3D frame is
 pixel-identical to what the compositor is about to show. Windows whose 2D
 box differs from their room box (tiled windows, which the ghosting
 force-floats) animate their real box along the way, so the client re-renders
-mid-flight and the content never pops scale.
+mid-flight and the content never pops scale. The player keeps their walk
+across toggles too: position and look angles are remembered, so re-entering
+the room continues where you left off instead of resetting to the spawn.
 
 ## Controls
 

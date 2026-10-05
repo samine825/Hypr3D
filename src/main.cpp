@@ -387,6 +387,15 @@ static float        g_playerAnimSpeed[4] = {1.f, 1.f, 1.f, 1.f};
 // the grid platform at world zero).
 static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 
+// The camera pose remembered across 3D sessions: the player's position is
+// kept (the physics body survives the toggle and pulls the camera back),
+// and the look angles must be remembered explicitly -- they would otherwise
+// reset to the spawn orientation on every entry.
+static Vec3  g_savedCamPos{};
+static float g_savedCamYaw   = 0.0f;
+static float g_savedCamPitch = 0.0f;
+static bool  g_savedCamValid = false;
+
 // Walking physics state (grounded comes from the Jolt body's ground ray).
 static bool g_grounded = false;
 
@@ -2278,6 +2287,11 @@ static CBox lerpBox(const CBox& A, const CBox& B, float t) {
     };
 }
 
+static float smoothstep01(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
+}
+
 static bool boxesDiffer(const CBox& A, const CBox& B) {
     return std::fabs(A.x - B.x) > 0.5 || std::fabs(A.y - B.y) > 0.5 ||
         std::fabs(A.w - B.w) > 0.5 || std::fabs(A.h - B.h) > 0.5;
@@ -2505,7 +2519,17 @@ static void applyViewMorph(const PHLMONITOR& mon) {
     const float RAW = std::clamp(g_transition, 0.0f, 1.0f);
 
     g_morphS = RAW * RAW * (3.0f - 2.0f * RAW);
-    g_scene.setEnvAlpha(g_morphS);
+
+    // On the way IN the room materializes twice as fast as the windows fly:
+    // Hyprland is still fade-hiding the freshly ghosted 2D windows under the
+    // desktop, and an exposed desktop mid-flight would show them stacked
+    // under the flying quads. The room's opaque environment covers the
+    // desktop before the quads get halfway. (The alpha channels cannot be
+    // forced quiet instead -- they bake into the snapshots.) On the way OUT
+    // the environment follows the flight, as before: the desktop it reveals
+    // shows no windows until the teardown restores them.
+    g_scene.setEnvAlpha(g_viewMorph == EViewMorph::To3D ?
+        smoothstep01(std::min(1.0f, RAW * 2.0f)) : g_morphS);
 
     applyViewMorphWindows(mon, g_morphS);
 
@@ -2795,9 +2819,18 @@ static void deactivate3D() {
 
     // Positions are per-mode: remember the room as it was for the next
     // session -- unless the exit morph already saved the poses (the entity
-    // poses are at the screen endpoints by now).
+    // poses are at the screen endpoints by now). The camera pose rides the
+    // same memory: the next entry resumes the walk, look angles included.
     if (g_viewMorph != EViewMorph::To2D)
         saveViewPoses();
+
+    {
+        const auto& CAM = g_scene.camera();
+        g_savedCamPos   = CAM.position;
+        g_savedCamYaw   = CAM.yaw;
+        g_savedCamPitch = CAM.pitch;
+        g_savedCamValid = true;
+    }
 
     g_viewMorph       = EViewMorph::None;
     g_viewMorphArmed  = false;
@@ -2904,17 +2937,26 @@ static void enter3D() {
     // Player spawn point (config player_spawn): the coordinates are the
     // player's FEET, so spawning at 0,0,0 stands on the grid platform at
     // world zero instead of falling through it. Eyes ride kEyeHeight above.
+    // A previous session restores its full camera pose instead: the walk
+    // continues where it left off, look angles included.
     {
         auto& CAM = g_scene.camera();
-        CAM.position = Vec3{
-            g_playerSpawn.x,
-            g_playerSpawn.y + Camera::kEyeHeight,
-            g_playerSpawn.z,
-        };
 
-        // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
-        // from (x, z) means yaw = atan2(-x, z).
-        CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+        if (g_savedCamValid) {
+            CAM.position = g_savedCamPos;
+            CAM.yaw      = g_savedCamYaw;
+            CAM.pitch    = g_savedCamPitch;
+        } else {
+            CAM.position = Vec3{
+                g_playerSpawn.x,
+                g_playerSpawn.y + Camera::kEyeHeight,
+                g_playerSpawn.z,
+            };
+
+            // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
+            // from (x, z) means yaw = atan2(-x, z).
+            CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+        }
     }
 
     g_capture.releaseAll();
@@ -3007,10 +3049,16 @@ static void close3D() {
 static float updateTransition() {
     const auto now = std::chrono::steady_clock::now();
 
-    const float dt =
+    float dt =
         std::chrono::duration<float>(now - g_lastTick).count();
 
     g_lastTick = now;
+
+    // The tick clock runs only while the room renders. The first frame
+    // after a toggle carries the WHOLE 2D idle time as dt -- unclamped it
+    // would snap the transition to its target on frame one and the morph
+    // (or the old fade) would never be seen at all.
+    dt = std::clamp(dt, 0.0f, 0.1f);
 
     constexpr float duration = 0.55f;
     constexpr float speed = 1.0f / duration;
@@ -3020,7 +3068,7 @@ static float updateTransition() {
     else if (g_transition > g_transitionTarget)
         g_transition = std::max(g_transition - dt * speed, 0.0f);
 
-    return std::clamp(dt, 0.0f, 0.1f);
+    return dt;
 }
 
 // --- frame ------------------------------------------------------------------
