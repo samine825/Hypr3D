@@ -1,6 +1,8 @@
 #pragma once
 
 #include <hyprland/src/plugins/PluginAPI.hpp>
+#include <hyprland/src/desktop/view/WLSurface.hpp>
+#include <hyprland/src/pointer/PointerManager.hpp>
 
 namespace H3D::Compat {
 
@@ -32,5 +34,18 @@ void setPointerCapture(bool capture);
 // Hides the host cursor while the 3D view owns input (the plugin draws its own
 // crosshair). Requires the cursor gates to be hooked; returns false otherwise.
 bool setCursorHidden(bool hidden);
+
+// The cursor image most recently requested through the pointer manager --
+// recorded even while the gates swallow it, so the 3D view can draw the
+// client's cursor itself. Exactly one of buffer / surface is set.
+struct SCursorRequest {
+    SP<Aquamarine::IBuffer>       buffer;  // theme and cursor-shape cursors
+    float                         scale = 1.0f;
+    WP<Desktop::View::CWLSurface> surface; // client-drawn cursor surfaces
+    Vector2D                      hotspot; // logical px
+    uint64_t                      serial = 0;
+};
+
+const SCursorRequest& lastCursorRequest();
 
 } // namespace H3D::Compat

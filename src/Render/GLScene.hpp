@@ -120,6 +120,15 @@ class GLScene {
         float pxWorld = 0.0f;
         float ndcX    = 0.0f; // Screen: tip in normalized device coords
         float ndcY    = 0.0f;
+
+        // The client's own cursor image (premultiplied RGBA). Unset draws
+        // the built-in arrow. Sizes are in cursor pixels, the hotspot is
+        // where the tip/point lands.
+        unsigned int texture = 0;
+        float        texW    = 0.0f;
+        float        texH    = 0.0f;
+        float        hotX    = 0.0f;
+        float        hotY    = 0.0f;
     };
 
     void setPointer(const SPointer& pointer) {

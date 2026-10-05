@@ -1994,9 +1994,12 @@ void GLScene::drawPointer(const Mat4& vp, int width, int height) {
         {4.0f, 12.5f}, {9.5f, 18.0f}, {6.5f, 11.5f},
     };
     static_assert(std::size(ARROW) == kPointerVerts);
+    static_assert(kPointerVerts >= 6, "the VBO also holds the image quad");
 
-    // Slightly larger than the bare outline, about a 28px cursor.
-    constexpr float SIZE = 1.4f;
+    // The built-in arrow is slightly larger than its bare outline, about a
+    // 28px cursor; a client image is drawn at its own size.
+    constexpr float ARROW_SIZE = 1.4f;
+    const float SIZE = m_pointer.texture ? 1.0f : ARROW_SIZE;
 
     const auto toNdc = [&](float x, float y, float& nx, float& ny) {
         x *= SIZE;
@@ -2062,9 +2065,73 @@ void GLScene::drawPointer(const Mat4& vp, int width, int height) {
         glBindVertexArray(0);
     };
 
+    if (m_pointer.texture) {
+        // Two triangles over the image, its hotspot on the cursor point.
+        const float X0 = -m_pointer.hotX, Y0 = -m_pointer.hotY;
+        const float X1 = m_pointer.texW - m_pointer.hotX;
+        const float Y1 = m_pointer.texH - m_pointer.hotY;
+
+        const float CORNERS[6][4] = {
+            {X0, Y0, 0.0f, 0.0f}, {X1, Y0, 1.0f, 0.0f}, {X1, Y1, 1.0f, 1.0f},
+            {X0, Y0, 0.0f, 0.0f}, {X1, Y1, 1.0f, 1.0f}, {X0, Y1, 0.0f, 1.0f},
+        };
+
+        std::vector<float> verts;
+        verts.reserve(6 * 5);
+
+        for (const auto& C : CORNERS) {
+            float nx = 0.0f, ny = 0.0f;
+            if (!toNdc(C[0], C[1], nx, ny))
+                return;
+
+            // Flipped framebuffer, as below.
+            verts.insert(verts.end(), {nx, -ny, 0.0f, C[2], C[3]});
+        }
+
+        glUseProgram(m_sceneProgram);
+
+        const Mat4 IDENTITY = Mat4::identity();
+        glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
+        glUniform1i(m_sceneTextured, 1);
+        glUniform1i(m_sceneTexture, 0);
+        glUniform4f(m_sceneColorUniform, 1.0f, 1.0f, 1.0f, 1.0f);
+        glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
+
+        glActiveTexture(GL_TEXTURE0);
+        glBindTexture(GL_TEXTURE_2D, m_pointer.texture);
+
+        // Hyprland sets filtering per draw of its own; left at the GL default
+        // (a mipmap min filter, no mipmaps) the texture is incomplete and
+        // samples as opaque black.
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        // Wayland buffers carry premultiplied alpha.
+        glBlendFuncSeparate(GL_ONE, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+                            GL_ONE_MINUS_SRC_ALPHA);
+
+        glBindBuffer(GL_ARRAY_BUFFER, m_pointerVBO);
+        glBufferSubData(
+            GL_ARRAY_BUFFER, 0,
+            static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+            verts.data()
+        );
+
+        glBindVertexArray(m_pointerVAO);
+        glDrawArrays(GL_TRIANGLES, 0, 6);
+        glBindVertexArray(0);
+
+        glBindTexture(GL_TEXTURE_2D, 0);
+        glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE,
+                            GL_ONE_MINUS_SRC_ALPHA);
+        return;
+    }
+
     // A one-pixel black outline from eight offset copies, then the white
     // arrow: legible on any content, in any perspective.
-    constexpr float D = 1.0f / SIZE;
+    constexpr float D = 1.0f / ARROW_SIZE;
     constexpr float K = 0.7071f * D;
     const float OUTLINE[][2] = {
         {-D, 0.0f}, {D, 0.0f}, {0.0f, -D}, {0.0f, D},

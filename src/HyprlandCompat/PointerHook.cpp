@@ -41,7 +41,14 @@ void hkPointerMove(void* self, const Vector2D& delta) {
 // funnels here -- the renderer's setCursorSurface/FromName, the cursor
 // manager (theme + shape protocol) and direct callers. Nothing re-applies a
 // cursor image behind the gates while the 3D view owns input.
+SCursorRequest g_cursorRequest;
+
 void hkPMSetCursorSurface(void* self, SP<Desktop::View::CWLSurface> surf, const Vector2D& hotspot) {
+    g_cursorRequest.buffer.reset();
+    g_cursorRequest.surface = surf;
+    g_cursorRequest.hotspot = hotspot;
+    ++g_cursorRequest.serial;
+
     if (g_cursorHidden)
         return; // swallowed: the cursor image stays hidden while the 3D view owns input
 
@@ -50,6 +57,12 @@ void hkPMSetCursorSurface(void* self, SP<Desktop::View::CWLSurface> surf, const 
 }
 
 void hkPMSetCursorBuffer(void* self, SP<Aquamarine::IBuffer> buf, const Vector2D& hotspot, const float& scale) {
+    g_cursorRequest.buffer  = buf;
+    g_cursorRequest.scale   = scale > 0.0f ? scale : 1.0f;
+    g_cursorRequest.surface.reset();
+    g_cursorRequest.hotspot = hotspot;
+    ++g_cursorRequest.serial;
+
     if (g_cursorHidden)
         return;
 
@@ -165,6 +178,7 @@ bool installPointerHook(HANDLE handle, MotionSink sink) {
 }
 
 void removePointerHook() {
+    g_cursorRequest = {};
     g_capture       = false;
     g_sink          = nullptr;
     g_cursorHidden  = false;
@@ -199,6 +213,10 @@ bool setCursorHidden(bool hidden) {
 
     g_cursorHidden = hidden;
     return true;
+}
+
+const SCursorRequest& lastCursorRequest() {
+    return g_cursorRequest;
 }
 
 void setPointerCapture(bool capture) {

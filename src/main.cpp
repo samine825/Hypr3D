@@ -39,6 +39,8 @@
 #include <hyprland/src/pointer/PointerController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
 #include <hyprland/src/managers/SessionLockManager.hpp>
+#include <hyprland/src/render/Texture.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 
 // This system's lua headers (5.5) lost the extern "C" guard: including them
@@ -1148,6 +1150,9 @@ static bool captureWanted() {
 }
 
 static void vcMove(double dx, double dy);
+static void refreshCursorImage();
+static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
+                              Vector2D& hotspot);
 
 // Whether a global logical point lies on the monitor the room is drawn on.
 static bool onRoomMonitor(const Vector2D& pos) {
@@ -3255,6 +3260,7 @@ static void onRenderPre(PHLMONITOR mon) {
 
     g_monitor = mon;
     serviceCapture();
+    refreshCursorImage();
 }
 
 
@@ -4686,6 +4692,23 @@ static void dumpStatus() {
 
     out << "captureFrames=" << g_captureFrames << "\n";
 
+    {
+        const auto& REQ = Compat::lastCursorRequest();
+        SP<Render::ITexture> TEX;
+        Vector2D SIZE, HOT;
+        const bool OK = clientCursorImage(TEX, SIZE, HOT);
+
+        out << "cursorImage: serial=" << REQ.serial
+            << " kind=" << (REQ.buffer ? "buffer" : REQ.surface ? "surface" : "none")
+            << " usable=" << OK;
+        if (TEX)
+            out << " tex=" << TEX->m_texID << " type=" << (int)TEX->m_type
+                << " texSize=" << TEX->m_size.x << "x" << TEX->m_size.y
+                << " fmt=0x" << std::hex << TEX->m_drmFormat << std::dec;
+        out << " size=" << SIZE.x << "x" << SIZE.y << " hot=" << HOT.x << ","
+            << HOT.y << " vcSpace=" << (int)g_vcSpace << "\n";
+    }
+
     // Player body trace: wall glue, stick-slip or a resync fight show up
     // here directly (position/velocity vs the commanded velocity).
     if (!g_playerBody.IsInvalid() && g_bodyIf) {
@@ -4975,6 +4998,60 @@ static void vcEnterFromDesktop(const Vector2D& global) {
     vcResolveScreen(MON);
 }
 
+// The client's cursor image, recorded by the pointer hooks while the real
+// cursor is hidden. A theme or cursor-shape cursor arrives as a buffer and is
+// uploaded once per request here, in render.pre (outside the frame's pass); a
+// client-drawn cursor surface already carries its texture.
+static uint64_t             g_cursorSerial = 0;
+static SP<Render::ITexture> g_cursorBufferTex;
+
+// Kept alive until the next frame: the scene samples it inside the pass.
+static SP<Render::ITexture> g_cursorTexHold;
+
+static void refreshCursorImage() {
+    const auto& REQ = Compat::lastCursorRequest();
+
+    if (REQ.serial == g_cursorSerial)
+        return;
+
+    g_cursorSerial = REQ.serial;
+    g_cursorBufferTex.reset();
+
+    if (REQ.buffer && g_pHyprRenderer) {
+        if (Render::GL::g_pHyprOpenGL)
+            Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+
+        g_cursorBufferTex = g_pHyprRenderer->createTexture(REQ.buffer);
+    }
+}
+
+// The current client cursor image: texture, logical size and hotspot. Only
+// plain RGBA textures; an external (EGLImage) one needs a different sampler,
+// and the built-in arrow stands in for it.
+static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
+                              Vector2D& hotspot) {
+    const auto& REQ = Compat::lastCursorRequest();
+
+    if (const auto SURF = REQ.surface.lock()) {
+        const auto RES = SURF->resource();
+        if (!RES)
+            return false;
+
+        tex  = RES->m_current.texture;
+        size = RES->m_current.size;
+    } else if (REQ.buffer && g_cursorBufferTex) {
+        tex  = g_cursorBufferTex;
+        size = REQ.buffer->size / REQ.scale;
+    } else
+        return false;
+
+    hotspot = REQ.hotspot;
+
+    return tex && tex->m_texID != 0 && size.x > 0 && size.y > 0 &&
+        (tex->m_type == Render::TEXTURE_RGBA ||
+         tex->m_type == Render::TEXTURE_RGBX);
+}
+
 // Where the scene draws the virtual cursor this frame.
 static void updatePointerVisual() {
     GLScene::SPointer P;
@@ -4991,6 +5068,19 @@ static void updatePointerVisual() {
             P.right   = g_world.rightOf(E->id);
             P.down    = g_world.upOf(E->id) * -1.0f;
             P.pxWorld = E->width / E->logicalWidth;
+
+            // On a window it shows what that client asked for (text beam,
+            // resize arrows, hand...), in the window's plane.
+            SP<Render::ITexture> TEX;
+            Vector2D SIZE, HOT;
+            if (clientCursorImage(TEX, SIZE, HOT)) {
+                g_cursorTexHold = TEX;
+                P.texture = TEX->m_texID;
+                P.texW    = static_cast<float>(SIZE.x);
+                P.texH    = static_cast<float>(SIZE.y);
+                P.hotX    = static_cast<float>(HOT.x);
+                P.hotY    = static_cast<float>(HOT.y);
+            }
         } else {
             // The window went away under the cursor: the next move
             // re-resolves from the last screen point.
@@ -6836,6 +6926,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     if (Render::GL::g_pHyprOpenGL) {
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        g_cursorBufferTex.reset();
+        g_cursorTexHold.reset();
         g_scene.shutdown();
     }
 }
