@@ -154,6 +154,16 @@ PHLLS findLayerById(std::uintptr_t id);
 
 void clearPointerFocus();
 
+// Whether a top or overlay layer surface (bar, sidebar, launcher,
+// notification) or a layer popup takes pointer input at a global point on
+// this monitor -- Hyprland's own hit test, input regions included. Those
+// draw over the room and are used as ordinary 2D surfaces.
+bool interactiveLayerAt(const PHLMONITOR& monitor, const Vector2D& global);
+
+// Whether keyboard focus is on a layer surface (a launcher, a sidebar's
+// text field): the room then leaves the keyboard and focus alone.
+bool layerHasKeyboardFocus();
+
 // Scroll for whatever surface holds pointer focus (set by deliverMotion).
 // `value120` is the hi-res wheel value (120 per detent, 0 for smooth).
 void deliverAxis(

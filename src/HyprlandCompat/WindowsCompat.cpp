@@ -2,6 +2,8 @@
 
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
+#include <hyprland/src/desktop/state/ViewState.hpp>
+#include <hyprland/src/desktop/state/LayerState.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Popup.hpp>
@@ -536,6 +538,46 @@ static SP<CWLSurfaceResource> surfaceAt(const PHLWINDOW& window, Vector2D& local
         }
     }
     return window->resource();
+}
+
+bool interactiveLayerAt(const PHLMONITOR& monitor, const Vector2D& global) {
+    if (!monitor || !Desktop::viewState())
+        return false;
+
+    const auto HIT = Desktop::viewState()->hitTest();
+
+    Vector2D coords;
+    PHLLS    found;
+
+    if (HIT.layerPopupSurfaceAt(global, monitor, &coords, &found))
+        return true;
+
+    constexpr size_t LAYER_TOP = 2, LAYER_OVERLAY = 3;
+
+    for (const size_t L : {LAYER_OVERLAY, LAYER_TOP}) {
+        if (HIT.layerSurfaceAt(global, &monitor->m_layerSurfaceLayers[L],
+                               &coords, &found))
+            return true;
+    }
+
+    return false;
+}
+
+bool layerHasKeyboardFocus() {
+    if (!g_pSeatManager || !Desktop::layerState())
+        return false;
+
+    const auto FOCUS = g_pSeatManager->m_state.keyboardFocus.lock();
+    if (!FOCUS)
+        return false;
+
+    for (const auto& LS : Desktop::layerState()->layers()) {
+        if (LS && LS->m_layerSurface &&
+            LS->m_layerSurface->m_surface.lock() == FOCUS)
+            return true;
+    }
+
+    return false;
 }
 
 void deliverAxis(

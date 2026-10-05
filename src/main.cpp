@@ -1575,7 +1575,8 @@ static World3D::SHit aimHit();
 // window typed into.
 static void updateAimFocus(float dt) {
     // Typing mode: the virtual cursor owns focus (focus follows it).
-    if (g_pointerDown || g_clientButtonDown || pointerFree())
+    if (g_pointerDown || g_clientButtonDown || pointerFree() ||
+        Compat::layerHasKeyboardFocus())
         return;
 
     const auto& cam = g_scene.camera();
@@ -4845,9 +4846,11 @@ static void vcEnterWindow(const World3D::SHit& hit) {
     g_vcLocal = Vector2D{std::clamp(hit.u, 0.0f, 1.0f) * E->logicalWidth,
                          std::clamp(hit.v, 0.0f, 1.0f) * E->logicalHeight};
 
-    // Focus follows the cursor; layers (bars, panels) never take it.
+    // Focus follows the cursor; layers (bars, panels) never take it, and a
+    // layer holding the keyboard (a launcher) keeps it until a click.
     const auto TARGET = targetFromHit(hit.id);
-    if (TARGET.window && g_lastFocusId != hit.id) {
+    if (TARGET.window && g_lastFocusId != hit.id &&
+        !Compat::layerHasKeyboardFocus()) {
         Compat::focusWindow(TARGET.window);
         g_lastFocusId = hit.id;
     }
@@ -4903,6 +4906,14 @@ static void vcResolveScreen(const PHLMONITOR& mon) {
                               std::clamp(g_vcScreen.y, 0.0, SIZE.y - 1)};
     }
 
+    // A bar, sidebar, launcher or notification drawn over the room: hand
+    // the pointer to the real cursor there, Hyprland drives it natively.
+    if (const Vector2D GLOBAL = mon->m_position + g_vcScreen;
+        Compat::interactiveLayerAt(mon, GLOBAL)) {
+        vcLeaveToDesktop(GLOBAL);
+        return;
+    }
+
     const World3D::SHit HIT = pickVisible(screenRay(mon, g_vcScreen));
 
     if (HIT.hit) {
@@ -4947,6 +4958,14 @@ static void vcMove(double dx, double dy) {
                 projectToScreen(MON, windowPoint(*E, next), projected);
 
             if (INSIDE) {
+                // The part of the window under a bar is the bar's.
+                if (ON_SCREEN &&
+                    Compat::interactiveLayerAt(MON, MON->m_position + projected)) {
+                    g_vcScreen = projected;
+                    vcLeaveToDesktop(MON->m_position + projected);
+                    return;
+                }
+
                 g_vcLocal = next;
                 if (ON_SCREEN)
                     g_vcScreen = projected;
@@ -5270,7 +5289,10 @@ static void onMouseMove(Vector2D pos, Event::SCallbackInfo& info) {
         // In the room the hook owns the motion. Out on the desktop the
         // ordinary cursor runs until it comes back over the room.
         if (g_vcSpace == ECursorSpace::Desktop) {
-            if (onRoomMonitor(pos)) {
+            // Over a layer on the room monitor the real cursor stays: the
+            // bar and its popups get ordinary input.
+            if (onRoomMonitor(pos) &&
+                !Compat::interactiveLayerAt(targetMonitor(), pos)) {
                 vcEnterFromDesktop(pos);
                 info.cancelled = true;
             }
@@ -5570,6 +5592,13 @@ static void onMouseButton(
             return;
 
         const auto LOCAL = surfaceLocal(*E, g_vcLocal);
+
+        // A click focuses, as on the desktop -- also taking the keyboard
+        // back from a launcher or sidebar.
+        if (TARGET.window) {
+            Compat::focusWindow(TARGET.window);
+            g_lastFocusId = g_vcId;
+        }
 
         if (TARGET.layer)
             Compat::deliverClick(TARGET.layer, LOCAL, event.button, true, event.timeMs);
@@ -5970,6 +5999,14 @@ static void onKeyboardKey(
         g_superHeld = PRESSED;
     else if (SYM == XKB_KEY_Alt_L)
         g_altHeld = PRESSED;
+
+    // A layer holds the keyboard (launcher, sidebar text field): every key
+    // is its, in both modes. Held camera keys must not keep walking.
+    if (Compat::layerHasKeyboardFocus()) {
+        if (PRESSED)
+            resetCameraKeys();
+        return;
+    }
 
     // Walking mode: Space jumps off whatever the capsule stands on. The
     // held state still reaches setMovementSym, but the walking movement
