@@ -121,18 +121,20 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
             &COLLECT);
     }
 
-    // Layer-shell surfaces (panels, bars, quickshell PanelWindow) live
-    // outside the window list; show them in the room as regular entities.
-    // The background layer is skipped -- that is where wallpapers live, and a
-    // full-screen wallpaper would swallow the whole room. Their boxes are
-    // monitor-local and decoration-free.
-    constexpr uint32_t LAYER_BACKGROUND = 0;
+    // Bottom-layer surfaces (desktop widgets) live outside the window list
+    // and sit under the room, so they join it as regular entities. The
+    // background layer is skipped -- that is where wallpapers live, and a
+    // full-screen wallpaper would swallow the whole room. Top and overlay
+    // layers (bars, launchers, notifications) are drawn by Hyprland over the
+    // room and stay ordinary 2D surfaces. Their boxes are monitor-local and
+    // decoration-free.
+    constexpr uint32_t LAYER_BOTTOM = 1;
 
     for (const auto& LAYERLIST : monitor->m_layerSurfaceLayers) {
         for (const auto& LSREF : LAYERLIST) {
             const auto LS = LSREF.lock();
 
-            if (!LS || !LS->visible() || LS->m_layer == LAYER_BACKGROUND)
+            if (!LS || !LS->visible() || LS->m_layer != LAYER_BOTTOM)
                 continue;
 
             const auto BOXOPT = LS->surfaceLogicalBox();
