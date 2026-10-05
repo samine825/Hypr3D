@@ -142,6 +142,13 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
             if (!BOXOPT || BOXOPT->w <= 0 || BOXOPT->h <= 0)
                 continue;
 
+            // A monitor-covering surface is a wallpaper or backdrop drawn on
+            // the bottom layer (Quickshell's background module does this),
+            // never a widget: it would sit in the room as a giant panel.
+            if (BOXOPT->w >= monitor->m_size.x * 0.95 &&
+                BOXOPT->h >= monitor->m_size.y * 0.95)
+                continue;
+
             SWindowInfo info;
             info.id      = reinterpret_cast<std::uintptr_t>(LS.get());
             info.layer   = LS;
