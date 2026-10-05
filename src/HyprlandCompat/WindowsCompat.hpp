@@ -154,4 +154,15 @@ PHLLS findLayerById(std::uintptr_t id);
 
 void clearPointerFocus();
 
+// Scroll for whatever surface holds pointer focus (set by deliverMotion).
+// `value120` is the hi-res wheel value (120 per detent, 0 for smooth).
+void deliverAxis(
+    uint32_t                           timeMs,
+    wl_pointer_axis                    axis,
+    double                             value,
+    int32_t                            value120,
+    wl_pointer_axis_source             source,
+    wl_pointer_axis_relative_direction relative
+);
+
 } // namespace H3D::Compat

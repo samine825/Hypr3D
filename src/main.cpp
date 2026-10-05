@@ -1127,6 +1127,28 @@ static bool pointerFree() {
     return g_keyboardMode == EKeyboardMode::Window;
 }
 
+// Typing-mode virtual cursor state; see the block above onRenderStage.
+enum class ECursorSpace : uint8_t { Desktop, Screen, Window };
+
+static ECursorSpace   g_vcSpace = ECursorSpace::Desktop;
+static Vector2D       g_vcScreen{}; // room-monitor-local logical px
+static std::uintptr_t g_vcId = 0;   // Window: the entity under the cursor
+static Vector2D       g_vcLocal{};  // Window: decorated-box px, top-left origin
+
+static bool virtualCursor() {
+    return pointerFree() && g_hookInstalled;
+}
+
+// Whether the hook should swallow pointer motion right now.
+static bool captureWanted() {
+    if (!g_hookInstalled || !ownsInput())
+        return false;
+
+    return !pointerFree() || g_vcSpace != ECursorSpace::Desktop;
+}
+
+static void vcMove(double dx, double dy);
+
 // Whether a global logical point lies on the monitor the room is drawn on.
 static bool onRoomMonitor(const Vector2D& pos) {
     const auto MON = targetMonitor();
@@ -1532,18 +1554,19 @@ static std::uintptr_t focusIdFor(std::uintptr_t id) {
     const auto IT = g_attachParent.find(id);
     return IT == g_attachParent.end() ? id : IT->second;
 }
+static World3D::SHit aimHit();
 
 // Handoff the keyboard to whatever the crosshair is on -- and to nothing else.
 // Aiming at empty space drops focus entirely rather than leaving the last
 // window typed into.
 static void updateAimFocus(float dt) {
-    if (g_pointerDown || g_clientButtonDown)
+    // Typing mode: the virtual cursor owns focus (focus follows it).
+    if (g_pointerDown || g_clientButtonDown || pointerFree())
         return;
 
     const auto& cam = g_scene.camera();
 
-    const World3D::SHit HIT =
-        g_world.pick(cam.position, cam.centerRay());
+    const World3D::SHit HIT = aimHit();
 
     // A scene model in front of the aimed window occludes it: no window
     // focus through geometry (one distance space for both classes).
@@ -2006,18 +2029,24 @@ static Vector2D localFromHit(const World3D::SHit& hit) {
     };
 }
 
-static World3D::SHit aimHit() {
+// Nearest hit along a camera ray whose pixels are actually visible. A window
+// that was never captured is drawn as nothing (the renderer skips it too), so
+// it must not catch the aim, focus or a click either -- an off-screen window
+// would otherwise sit invisibly in front of the view. An invisible layer
+// overlay (transparent quickshell PanelWindow) must not swallow the ray
+// either: empty pixels fall through to the surface underneath. This is also
+// what keeps aim/focus from flapping between an overlay and the window it
+// covers.
+static World3D::SHit pickVisible(const Vec3& dir) {
     const auto& cam = g_scene.camera();
 
-    // Nearest hit whose pixels are actually visible: an invisible layer
-    // overlay (transparent quickshell PanelWindow) must not swallow the
-    // crosshair -- empty pixels fall through to the surface underneath. This
-    // is also what keeps aim/focus from flapping between an overlay and the
-    // window it covers.
-    for (const auto& HIT : g_world.pickAll(cam.position, cam.centerRay())) {
+    for (const auto& HIT : g_world.pickAll(cam.position, dir)) {
         const auto* SNAPSHOT = g_capture.get(HIT.id);
 
-        if (SNAPSHOT && SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {
+        if (!SNAPSHOT || (!SNAPSHOT->bigTex && !SNAPSHOT->texID))
+            continue;
+
+        if (SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {
             const int MX = std::min(SNAPSHOT->alphaW - 1,
                 static_cast<int>(HIT.u * SNAPSHOT->alphaW));
             const int MY = std::min(SNAPSHOT->alphaH - 1,
@@ -2033,6 +2062,10 @@ static World3D::SHit aimHit() {
     }
 
     return {};
+}
+
+static World3D::SHit aimHit() {
+    return pickVisible(g_scene.camera().centerRay());
 }
 
 // Resolves a hit id into either a window or a layer surface.
@@ -3189,6 +3222,15 @@ static bool onPointerMotion(double dx, double dy) {
     if (!ownsInput())
         return false;
 
+    if (pointerFree()) {
+        if (g_vcSpace == ECursorSpace::Desktop)
+            return false; // the real cursor is out on the desktop
+
+        vcMove(dx, dy);
+        damageCurrentMonitor();
+        return true;
+    }
+
     g_input.addMotion(dx, dy);
     damageCurrentMonitor();
     return true;
@@ -3427,6 +3469,9 @@ static void enter3D() {
     g_scene.setCrosshairVisible(true);
     g_freeOnRoom     = false;
     g_swallowRelease = 0;
+    g_vcSpace        = ECursorSpace::Desktop;
+    g_vcId           = 0;
+    g_scene.setPointer({});
     g_altHeld      = false;
     s_zoomId       = 0;
 
@@ -3641,7 +3686,7 @@ static void update3D(float dt) {
     // Release capture unconditionally when the view no longer owns input, so
     // a disappearing monitor or a closing transition can never strand the
     // pointer in captured mode.
-    Compat::setPointerCapture(g_hookInstalled && ownsInput() && !pointerFree());
+    Compat::setPointerCapture(captureWanted());
 
     float yawDelta = 0.0f;
     float pitchDelta = 0.0f;
@@ -4654,6 +4699,315 @@ static void dumpStatus() {
     }
 }
 
+// --- typing-mode virtual cursor -----------------------------------------------
+//
+// In typing mode the pointer stays captured and drives a cursor of the
+// plugin's own, which lives in one of three spaces:
+//   Window  -- on a window, in the window's own pixels: mouse motion moves it
+//              1:1 across the content whatever the window's angle, the client
+//              gets ordinary pointer input there, and it is drawn in the
+//              window's plane.
+//   Screen  -- off windows, in the room monitor's pixels. Every move casts a
+//              ray through it; crossing a window drops into that window's
+//              space and focuses it.
+//   Desktop -- past the room monitor's edge: capture is released and the real
+//              cursor carries on across the other monitors as usual; coming
+//              back over the room recaptures it.
+// Without the pointer hook there is no relative motion to drive it, and
+// typing mode falls back to the plain free cursor.
+
+// The camera's screen basis, rolled exactly like Camera::view() and with the
+// zoomed fov the scene renders with (same derivation as the panorama).
+struct SViewBasis {
+    Vec3  pos, fwd, right, up;
+    float tanX = 1.0f, tanY = 1.0f;
+};
+
+static SViewBasis viewBasis(const PHLMONITOR& mon) {
+    const auto& CAM = g_scene.camera();
+
+    SViewBasis B;
+    B.pos = CAM.position;
+    B.fwd = CAM.forward();
+
+    const Vec3 RIGHT = CAM.right();
+    const Vec3 UP    = cross(RIGHT, B.fwd);
+
+    B.right = RIGHT * std::cos(CAM.roll) - UP * std::sin(CAM.roll);
+    B.up    = UP * std::cos(CAM.roll) + RIGHT * std::sin(CAM.roll);
+
+    B.tanY = std::tan(kFovDeg * 3.14159265f / 360.0f) /
+        std::max(g_scene.zoom(), 0.01f);
+    B.tanX = B.tanY * static_cast<float>(mon->m_size.x / mon->m_size.y);
+    return B;
+}
+
+static Vec3 screenRay(const PHLMONITOR& mon, const Vector2D& screen) {
+    const auto B = viewBasis(mon);
+
+    const float NX = static_cast<float>(screen.x / mon->m_size.x) * 2.0f - 1.0f;
+    const float NY = 1.0f - static_cast<float>(screen.y / mon->m_size.y) * 2.0f;
+
+    return normalize(B.fwd + B.right * (NX * B.tanX) + B.up * (NY * B.tanY));
+}
+
+static bool projectToScreen(const PHLMONITOR& mon, const Vec3& point,
+                            Vector2D& out) {
+    const auto B = viewBasis(mon);
+    const Vec3 D = point - B.pos;
+    const float Z = dot(D, B.fwd);
+
+    if (Z <= 1e-4f)
+        return false; // behind the camera
+
+    const float NX = dot(D, B.right) / (Z * B.tanX);
+    const float NY = dot(D, B.up) / (Z * B.tanY);
+
+    out = Vector2D{(NX + 1.0f) * 0.5f * mon->m_size.x,
+                   (1.0f - NY) * 0.5f * mon->m_size.y};
+    return true;
+}
+
+// World point of a decorated-box px position on an entity (it may lie
+// outside the box, on the window's plane).
+static Vec3 windowPoint(const World3D::SEntity& e, const Vector2D& local) {
+    const float X =
+        (static_cast<float>(local.x) / e.logicalWidth - 0.5f) * e.width;
+    const float Y =
+        (0.5f - static_cast<float>(local.y) / e.logicalHeight) * e.height;
+
+    return e.center + g_world.rightOf(e.id) * X + g_world.upOf(e.id) * Y;
+}
+
+// Decorated-box px -> client-surface px, the border ring clamped to the
+// surface edge (the same mapping as localFromHit).
+static Vector2D surfaceLocal(const World3D::SEntity& e, const Vector2D& local) {
+    return {
+        std::clamp(local.x - e.surfaceOffsetX, 0.0, (double)e.surfaceWidth),
+        std::clamp(local.y - e.surfaceOffsetY, 0.0, (double)e.surfaceHeight),
+    };
+}
+
+static void vcDeliverMotion() {
+    const auto* E = g_world.find(g_vcId);
+    if (!E)
+        return;
+
+    const auto TARGET = targetFromHit(g_vcId);
+    const auto LOCAL  = surfaceLocal(*E, g_vcLocal);
+
+    if (TARGET.layer)
+        Compat::deliverMotion(TARGET.layer, LOCAL, inputTimeMs());
+    else if (TARGET.window)
+        Compat::deliverMotion(TARGET.window, LOCAL, inputTimeMs());
+}
+
+static void vcEnterWindow(const World3D::SHit& hit) {
+    const auto* E = g_world.find(hit.id);
+    if (!E)
+        return;
+
+    g_vcSpace = ECursorSpace::Window;
+    g_vcId    = hit.id;
+    g_vcLocal = Vector2D{std::clamp(hit.u, 0.0f, 1.0f) * E->logicalWidth,
+                         std::clamp(hit.v, 0.0f, 1.0f) * E->logicalHeight};
+
+    // Focus follows the cursor; layers (bars, panels) never take it.
+    const auto TARGET = targetFromHit(hit.id);
+    if (TARGET.window && g_lastFocusId != hit.id) {
+        Compat::focusWindow(TARGET.window);
+        g_lastFocusId = hit.id;
+    }
+
+    vcDeliverMotion();
+}
+
+static PHLMONITOR monitorAt(const Vector2D& global) {
+    if (!State::monitorState())
+        return nullptr;
+
+    for (const auto& MON : State::monitorState()->monitors()) {
+        if (MON && CBox{MON->m_position, MON->m_size}.containsPoint(global))
+            return MON;
+    }
+
+    return nullptr;
+}
+
+static void vcLeaveToDesktop(const Vector2D& global) {
+    Compat::clearPointerFocus();
+
+    g_vcSpace = ECursorSpace::Desktop;
+    g_vcId    = 0;
+
+    // The desktop's focus-follows-mouse takes over; re-entering any room
+    // window, even the one just left, must focus it again.
+    g_lastFocusId = 0;
+
+    Compat::setPointerCapture(false);
+    Pointer::mgr()->warpTo(global);
+    Compat::setCursorHidden(false);
+
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->setCursorFromName("default", true);
+}
+
+// Screen space at g_vcScreen: leave for a neighbouring monitor past the edge
+// (clamp where there is none), else drop into whatever window is under it.
+static void vcResolveScreen(const PHLMONITOR& mon) {
+    const Vector2D SIZE = mon->m_size;
+
+    if (g_vcScreen.x < 0 || g_vcScreen.y < 0 || g_vcScreen.x >= SIZE.x ||
+        g_vcScreen.y >= SIZE.y) {
+        const Vector2D GLOBAL = mon->m_position + g_vcScreen;
+
+        if (const auto NEXT = monitorAt(GLOBAL); NEXT && NEXT != mon) {
+            vcLeaveToDesktop(GLOBAL);
+            return;
+        }
+
+        g_vcScreen = Vector2D{std::clamp(g_vcScreen.x, 0.0, SIZE.x - 1),
+                              std::clamp(g_vcScreen.y, 0.0, SIZE.y - 1)};
+    }
+
+    const World3D::SHit HIT = pickVisible(screenRay(mon, g_vcScreen));
+
+    if (HIT.hit) {
+        vcEnterWindow(HIT);
+        return;
+    }
+
+    if (g_vcSpace == ECursorSpace::Window)
+        Compat::clearPointerFocus();
+
+    g_vcSpace = ECursorSpace::Screen;
+    g_vcId    = 0;
+}
+
+static void vcMove(double dx, double dy) {
+    const auto MON = targetMonitor();
+    if (!MON)
+        return;
+
+    if (g_vcSpace == ECursorSpace::Window) {
+        const auto* E = g_world.find(g_vcId);
+
+        if (E && E->logicalWidth > 0 && E->logicalHeight > 0) {
+            Vector2D next = g_vcLocal + Vector2D{dx, dy};
+
+            // A held button keeps the window: a drag-select runs to the
+            // edge and stays there, like on a flat desktop.
+            if (g_clientButtonDown) {
+                next = Vector2D{std::clamp(next.x, 0.0, (double)E->logicalWidth),
+                                std::clamp(next.y, 0.0, (double)E->logicalHeight)};
+                g_vcLocal = next;
+                g_clientButtonLocal = surfaceLocal(*E, g_vcLocal);
+                vcDeliverMotion();
+                return;
+            }
+
+            const bool INSIDE = next.x >= 0 && next.y >= 0 &&
+                next.x <= E->logicalWidth && next.y <= E->logicalHeight;
+
+            Vector2D projected;
+            const bool ON_SCREEN =
+                projectToScreen(MON, windowPoint(*E, next), projected);
+
+            if (INSIDE) {
+                g_vcLocal = next;
+                if (ON_SCREEN)
+                    g_vcScreen = projected;
+                vcDeliverMotion();
+                return;
+            }
+
+            // Off the window's edge: carry on in screen space from where the
+            // exit point appears on screen.
+            if (ON_SCREEN)
+                g_vcScreen = projected;
+        }
+
+        Compat::clearPointerFocus();
+        g_vcSpace = ECursorSpace::Screen;
+        g_vcId    = 0;
+        vcResolveScreen(MON);
+        return;
+    }
+
+    if (g_vcSpace != ECursorSpace::Screen)
+        return;
+
+    g_vcScreen = g_vcScreen + Vector2D{dx, dy};
+    vcResolveScreen(MON);
+}
+
+// Typing mode starts at the crosshair: whatever the view was aiming at is
+// already under the cursor.
+static void vcBegin() {
+    const auto MON = targetMonitor();
+
+    g_vcSpace = ECursorSpace::Screen;
+    g_vcId    = 0;
+
+    if (!MON)
+        return;
+
+    g_vcScreen = MON->m_size * 0.5;
+    vcResolveScreen(MON);
+}
+
+// The real cursor came back over the room: capture it there again.
+static void vcEnterFromDesktop(const Vector2D& global) {
+    const auto MON = targetMonitor();
+    if (!MON)
+        return;
+
+    g_vcScreen = global - MON->m_position;
+    g_vcSpace  = ECursorSpace::Screen;
+
+    // Pointer focus still sits on the desktop window the cursor came from.
+    Compat::clearPointerFocus();
+    Compat::setPointerCapture(true);
+
+    if (Compat::setCursorHidden(true))
+        Pointer::mgr()->resetCursorImage();
+
+    vcResolveScreen(MON);
+}
+
+// Where the scene draws the virtual cursor this frame.
+static void updatePointerVisual() {
+    GLScene::SPointer P;
+
+    const auto MON = targetMonitor();
+
+    if (virtualCursor() && MON && g_vcSpace != ECursorSpace::Desktop) {
+        const auto* E = g_vcSpace == ECursorSpace::Window ?
+            g_world.find(g_vcId) : nullptr;
+
+        if (E && E->logicalWidth > 0) {
+            P.mode    = GLScene::SPointer::EMode::World;
+            P.tip     = windowPoint(*E, g_vcLocal);
+            P.right   = g_world.rightOf(E->id);
+            P.down    = g_world.upOf(E->id) * -1.0f;
+            P.pxWorld = E->width / E->logicalWidth;
+        } else {
+            // The window went away under the cursor: the next move
+            // re-resolves from the last screen point.
+            if (g_vcSpace == ECursorSpace::Window) {
+                g_vcSpace = ECursorSpace::Screen;
+                g_vcId    = 0;
+            }
+
+            P.mode = GLScene::SPointer::EMode::Screen;
+            P.ndcX = static_cast<float>(g_vcScreen.x / MON->m_size.x) * 2.0f - 1.0f;
+            P.ndcY = 1.0f - static_cast<float>(g_vcScreen.y / MON->m_size.y) * 2.0f;
+        }
+    }
+
+    g_scene.setPointer(P);
+}
+
 static void onRenderStage(eRenderStage stage) {
     if (g_capturing)
         return;
@@ -4712,6 +5066,8 @@ static void onRenderStage(eRenderStage stage) {
     if (g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D)
         g_diagAlpha = g_fsAlpha;
 
+    updatePointerVisual();
+
     g_pHyprRenderer->addPassElement(
         makeUnique<CHypr3DPassElement>(
             g_diagAlpha,
@@ -4746,17 +5102,29 @@ static void setKeyboardMode(EKeyboardMode mode) {
     if (pointerFree()) {
         resetCameraKeys(); // held camera keys must not keep walking
         resetPointerGesture();
+        finishClientButton(inputTimeMs());
         g_input.reset(); // drop pending look: the view stops dead
 
-        Compat::setPointerCapture(false);
-        Compat::setCursorHidden(false);
         Compat::clearPointerFocus();
 
-        if (g_pHyprRenderer)
-            g_pHyprRenderer->setCursorFromName("default", true);
+        if (virtualCursor()) {
+            // The pointer stays captured and drives the plugin's cursor.
+            vcBegin();
+        } else {
+            Compat::setPointerCapture(false);
+            Compat::setCursorHidden(false);
 
-        g_freeOnRoom = true;
+            if (g_pHyprRenderer)
+                g_pHyprRenderer->setCursorFromName("default", true);
+
+            g_freeOnRoom = true;
+        }
     } else {
+        finishClientButton(inputTimeMs());
+        Compat::clearPointerFocus();
+        g_vcSpace = ECursorSpace::Desktop;
+        g_vcId    = 0;
+
         Compat::setPointerCapture(g_hookInstalled && ownsInput());
 
         if (Compat::setCursorHidden(true))
@@ -4770,9 +5138,10 @@ static void setKeyboardMode(EKeyboardMode mode) {
     g_scene.setCrosshairVisible(!pointerFree());
 
     notify(
-        pointerFree() ?
-            "[hypr3d] typing: free cursor (back button / click the room to return)" :
-            "[hypr3d] moving: wasd / space / shift / ctrl",
+        !pointerFree() ? "[hypr3d] moving: wasd / space / shift / ctrl" :
+        virtualCursor() ?
+            "[hypr3d] typing: cursor on the windows (back button to return)" :
+            "[hypr3d] typing: free cursor (back button / click the room to return)",
         CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
     );
 
@@ -4785,6 +5154,21 @@ static void onMouseMove(Vector2D pos, Event::SCallbackInfo& info) {
 
     if (!ownsInput())
         return;
+
+    if (virtualCursor()) {
+        // In the room the hook owns the motion. Out on the desktop the
+        // ordinary cursor runs until it comes back over the room.
+        if (g_vcSpace == ECursorSpace::Desktop) {
+            if (onRoomMonitor(pos)) {
+                vcEnterFromDesktop(pos);
+                info.cancelled = true;
+            }
+            return;
+        }
+
+        info.cancelled = true;
+        return;
+    }
 
     if (pointerFree()) {
         // Over the room, the 2D windows under the cursor are the ghosted
@@ -4836,6 +5220,22 @@ static void onMouseAxis(
 ) {
     if (!ownsInput())
         return;
+
+    // Virtual cursor: scroll the window under it; empty space swallows it.
+    if (virtualCursor()) {
+        if (g_vcSpace == ECursorSpace::Desktop)
+            return;
+
+        info.cancelled = true;
+
+        if (g_vcSpace == ECursorSpace::Window) {
+            vcDeliverMotion();
+            Compat::deliverAxis(event.timeMs, event.axis, event.delta,
+                                event.deltaDiscrete, event.source,
+                                event.relativeDirection);
+        }
+        return;
+    }
 
     // Free cursor: scrolling belongs to the desktop, never to the hidden
     // 2D windows under the room.
@@ -5031,6 +5431,44 @@ static void onMouseButton(
         }
 
         info.cancelled = true;
+        return;
+    }
+
+    // Virtual cursor: buttons go to the window under it, natively. Empty
+    // space swallows them; out on the desktop they are ordinary clicks.
+    if (virtualCursor()) {
+        if (g_vcSpace == ECursorSpace::Desktop)
+            return;
+
+        info.cancelled = true;
+
+        if (!PRESSED) {
+            if (g_clientButtonDown && event.button == g_clientButton)
+                finishClientButton(event.timeMs);
+            return;
+        }
+
+        if (g_vcSpace != ECursorSpace::Window || g_clientButtonDown)
+            return;
+
+        const auto* E = g_world.find(g_vcId);
+        const auto TARGET = targetFromHit(g_vcId);
+
+        if (!E || (!TARGET.window && !TARGET.layer))
+            return;
+
+        const auto LOCAL = surfaceLocal(*E, g_vcLocal);
+
+        if (TARGET.layer)
+            Compat::deliverClick(TARGET.layer, LOCAL, event.button, true, event.timeMs);
+        else
+            Compat::deliverClick(TARGET.window, LOCAL, event.button, true, event.timeMs);
+
+        g_clientButtonWindow = TARGET.window;
+        g_clientButtonLayer  = TARGET.layer;
+        g_clientButton       = event.button;
+        g_clientButtonLocal  = LOCAL;
+        g_clientButtonDown   = true;
         return;
     }
 

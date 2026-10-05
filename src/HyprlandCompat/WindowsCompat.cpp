@@ -529,6 +529,27 @@ static SP<CWLSurfaceResource> surfaceAt(const PHLWINDOW& window, Vector2D& local
     return window->resource();
 }
 
+void deliverAxis(
+    uint32_t                           timeMs,
+    wl_pointer_axis                    axis,
+    double                             value,
+    int32_t                            value120,
+    wl_pointer_axis_source             source,
+    wl_pointer_axis_relative_direction relative
+) {
+    if (!g_pSeatManager)
+        return;
+
+    // The legacy discrete step: whole detents, at least one for any hi-res
+    // movement, as the compositor's own wheel path reports it.
+    int32_t discrete = value120 / 120;
+    if (discrete == 0 && value120 != 0)
+        discrete = value120 > 0 ? 1 : -1;
+
+    g_pSeatManager->sendPointerAxis(timeMs, axis, value, discrete, value120, source, relative);
+    g_pSeatManager->sendPointerFrame();
+}
+
 void deliverMotion(
     const PHLWINDOW& window,
     const Vector2D& localLogical,

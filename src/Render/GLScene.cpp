@@ -945,6 +945,36 @@ bool GLScene::createMeshes() {
 
     glBindVertexArray(0);
 
+    // Typing-mode cursor: same vertex layout, filled per frame with
+    // already-projected NDC positions.
+    glGenVertexArrays(1, &m_pointerVAO);
+    glGenBuffers(1, &m_pointerVBO);
+
+    glBindVertexArray(m_pointerVAO);
+    glBindBuffer(GL_ARRAY_BUFFER, m_pointerVBO);
+
+    const std::vector<float> pointer(kPointerVerts * 5, 0.0f);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(pointer.size() * sizeof(float)),
+        pointer.data(),
+        GL_DYNAMIC_DRAW
+    );
+
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(
+        0, 3, GL_FLOAT, GL_FALSE,
+        5 * sizeof(float), reinterpret_cast<void*>(0)
+    );
+
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(
+        1, 2, GL_FLOAT, GL_FALSE,
+        5 * sizeof(float), reinterpret_cast<void*>(3 * sizeof(float))
+    );
+
+    glBindVertexArray(0);
+
     return true;
 }
 
@@ -1949,6 +1979,104 @@ void GLScene::drawCrosshair(int width, int height) {
     drawLayer(OUTER_PX, INNER_PX, THICK_PX, 0.0f, 0.0f, 0.0f, 1.0f);
 }
 
+void GLScene::drawPointer(const Mat4& vp, int width, int height) {
+    if (m_pointer.mode == SPointer::EMode::Hidden || !m_pointerVAO ||
+        !m_pointerVBO || width <= 0 || height <= 0)
+        return;
+
+    // Arrow outline in cursor pixels (x right, y down, tip at the origin),
+    // as five triangles.
+    static constexpr float ARROW[][2] = {
+        {0.0f, 0.0f},  {0.0f, 16.0f}, {4.0f, 12.5f},
+        {0.0f, 0.0f},  {4.0f, 12.5f}, {6.5f, 11.5f},
+        {0.0f, 0.0f},  {6.5f, 11.5f}, {11.5f, 11.5f},
+        {4.0f, 12.5f}, {7.0f, 19.0f}, {9.5f, 18.0f},
+        {4.0f, 12.5f}, {9.5f, 18.0f}, {6.5f, 11.5f},
+    };
+    static_assert(std::size(ARROW) == kPointerVerts);
+
+    // Slightly larger than the bare outline, about a 28px cursor.
+    constexpr float SIZE = 1.4f;
+
+    const auto toNdc = [&](float x, float y, float& nx, float& ny) {
+        x *= SIZE;
+        y *= SIZE;
+
+        if (m_pointer.mode == SPointer::EMode::Screen) {
+            nx = m_pointer.ndcX + x * 2.0f / static_cast<float>(width);
+            ny = m_pointer.ndcY - y * 2.0f / static_cast<float>(height);
+            return true;
+        }
+
+        const Vec3 P = m_pointer.tip +
+            m_pointer.right * (x * m_pointer.pxWorld) +
+            m_pointer.down * (y * m_pointer.pxWorld);
+
+        // Column-major vp * (P, 1).
+        const auto& M = vp.m;
+        const float CX = M[0] * P.x + M[4] * P.y + M[8] * P.z + M[12];
+        const float CY = M[1] * P.x + M[5] * P.y + M[9] * P.z + M[13];
+        const float CW = M[3] * P.x + M[7] * P.y + M[11] * P.z + M[15];
+
+        if (CW <= 1e-4f)
+            return false; // behind the camera
+
+        nx = CX / CW;
+        ny = CY / CW;
+        return true;
+    };
+
+    const auto drawLayer = [&](float ox, float oy, float r, float g, float b) {
+        std::vector<float> verts;
+        verts.reserve(kPointerVerts * 5);
+
+        for (const auto& V : ARROW) {
+            float nx = 0.0f, ny = 0.0f;
+            if (!toNdc(V[0] + ox, V[1] + oy, nx, ny))
+                return;
+
+            // Drawn straight into Hyprland's framebuffer, which is stored
+            // vertically flipped (the scene blit flips v for the same
+            // reason): mirror y or the arrow and its motion appear upside
+            // down.
+            verts.insert(verts.end(), {nx, -ny, 0.0f, 0.0f, 0.0f});
+        }
+
+        glUseProgram(m_sceneProgram);
+
+        const Mat4 IDENTITY = Mat4::identity();
+        glUniformMatrix4fv(m_sceneMVP, 1, GL_FALSE, IDENTITY.m.data());
+        glUniform1i(m_sceneTextured, 0);
+        glUniform4f(m_sceneColorUniform, r, g, b, 1.0f);
+        glUniform4f(m_sceneUVRect, 0.0f, 0.0f, 1.0f, 1.0f);
+
+        glBindBuffer(GL_ARRAY_BUFFER, m_pointerVBO);
+        glBufferSubData(
+            GL_ARRAY_BUFFER, 0,
+            static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
+            verts.data()
+        );
+
+        glBindVertexArray(m_pointerVAO);
+        glDrawArrays(GL_TRIANGLES, 0, kPointerVerts);
+        glBindVertexArray(0);
+    };
+
+    // A one-pixel black outline from eight offset copies, then the white
+    // arrow: legible on any content, in any perspective.
+    constexpr float D = 1.0f / SIZE;
+    constexpr float K = 0.7071f * D;
+    const float OUTLINE[][2] = {
+        {-D, 0.0f}, {D, 0.0f}, {0.0f, -D}, {0.0f, D},
+        {-K, -K},   {K, -K},   {-K, K},    {K, K},
+    };
+
+    for (const auto& O : OUTLINE)
+        drawLayer(O[0], O[1], 0.0f, 0.0f, 0.0f);
+
+    drawLayer(0.0f, 0.0f, 1.0f, 1.0f, 1.0f);
+}
+
 void GLScene::drawFullscreen(
     float alpha,
     bool perPixel
@@ -2420,6 +2548,7 @@ bool GLScene::render(
 
     drawFullscreen(std::clamp(alpha, 0.0f, 1.0f), MORPH);
     drawCrosshair(width, height);
+    drawPointer(vp, width, height);
 
     // --- restore compositor state ---
     glUseProgram(static_cast<GLuint>(oldProgram));
@@ -2575,6 +2704,16 @@ void GLScene::destroyGLObjects() {
     if (m_crosshairVAO) {
         glDeleteVertexArrays(1, &m_crosshairVAO);
         m_crosshairVAO = 0;
+    }
+
+    if (m_pointerVBO) {
+        glDeleteBuffers(1, &m_pointerVBO);
+        m_pointerVBO = 0;
+    }
+
+    if (m_pointerVAO) {
+        glDeleteVertexArrays(1, &m_pointerVAO);
+        m_pointerVAO = 0;
     }
 
     if (m_fullscreenVBO) {
