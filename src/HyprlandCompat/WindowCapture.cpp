@@ -620,6 +620,12 @@ void CWindowCapture::refreshSkirtMask(std::uintptr_t id, SSnapshot& snapshot,
     if (!monitor)
         return;
 
+    // View morph / fullscreen transition: boxes are being driven every
+    // frame, a trace now would be stale on arrival. The cadence re-traces
+    // once the flag clears and the boxes settle.
+    if (m_skirtDeferred)
+        return;
+
     auto& ST = m_skirtStates[id];
 
     const int CBW = static_cast<int>(snapshot.sampledBox.w);
@@ -720,6 +726,9 @@ void CWindowCapture::refreshSkirtMask(std::uintptr_t id, SSnapshot& snapshot,
 // path (a tiled window resized below the monitor size re-routes through
 // makeSnapshot's non-tiled path, so stale tiled outlines self-heal).
 void CWindowCapture::refreshSkirtMaskTiled(std::uintptr_t id, SSnapshot& snapshot) {
+    if (m_skirtDeferred)
+        return; // view morph / FS transition: postpone, see refreshSkirtMask
+
     auto& ST = m_skirtStates[id];
     ++ST.age;
 

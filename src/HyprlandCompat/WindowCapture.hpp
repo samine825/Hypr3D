@@ -118,6 +118,15 @@ class CWindowCapture {
     // the layer's monitor-local box, no decorations, no off-screen pull.
     bool makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& monitor, bool force = false);
 
+    // While set, the depth-slab silhouette traces are postponed entirely:
+    // the view morph resizes boxes every frame and a mid-flight trace is
+    // wasted work. The analytic fallback outlines cover the visuals; the
+    // stale/settle cadence re-traces at full resolution on the first steady
+    // frames after the flag clears.
+    void setSkirtDeferred(bool on) {
+        m_skirtDeferred = on;
+    }
+
   private:
     // Oversized windows: monitor-sized tiles, composited into one texture.
     bool makeTiledSnapshot(
@@ -166,6 +175,7 @@ class CWindowCapture {
   private:
     std::unordered_map<std::uintptr_t, SSnapshot> m_snapshots;
     std::unordered_map<std::uintptr_t, SSkirtState> m_skirtStates;
+    bool m_skirtDeferred = false;
 };
 
 } // namespace H3D::Compat

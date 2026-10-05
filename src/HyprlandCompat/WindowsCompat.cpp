@@ -191,6 +191,17 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     if (!WINDOW || !WINDOW->m_target)
         return;
 
+    // Clear the ghost link FIRST. assignToSpace straight from the ghost
+    // state takes the space->move() branch (the ghosted target was never a
+    // member of its space, but HAD_SPACE reads true from the ghost
+    // pointer), and the layout algorithm learns nothing from a moveTarget()
+    // of a window it does not know -- the window then never re-tiles: it
+    // stays floating wherever the session left it, unmanaged, keeping the
+    // 3D-session box (the "frozen third state" and the size leak). With the
+    // ghost cleared first, HAD_SPACE is false and the space->add() branch
+    // runs, which properly inserts the target into the layout algorithm.
+    WINDOW->m_target->setSpaceGhost(nullptr);
+
     // Put the target back into its space while it is still floating. For a
     // window that was floating before 3D, retain the real box produced by the
     // 3D resize. Tiled windows deliberately return to their original layout.
@@ -199,7 +210,7 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     if (save.space)
         WINDOW->m_target->assignToSpace(save.space);
     else
-        WINDOW->m_target->setSpaceGhost(nullptr);
+        WINDOW->m_target->assignToSpace(nullptr); // force-clear the ghost flag
 
     WINDOW->m_target->setFloating(true);
     WINDOW->m_target->setPositionGlobal(RESTORE_BOX);

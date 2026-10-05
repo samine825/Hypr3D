@@ -394,6 +394,7 @@ static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
 static Vec3  g_savedCamPos{};
 static float g_savedCamYaw   = 0.0f;
 static float g_savedCamPitch = 0.0f;
+static int   g_savedViewMode = 0; // F5 camera mode (0 first, 1/2 third)
 static bool  g_savedCamValid = false;
 
 // Walking physics state (grounded comes from the Jolt body's ground ray).
@@ -1278,13 +1279,22 @@ static void refreshCaptures(
         const bool ALPHA_GRACE = info.window &&
             alphaGrace.count(info.id) > 0;
 
-        const bool FORCE =
-            FADING ||
+        // During the view morph the quads' content is static -- only the
+        // animBox windows need retakes (their real boxes resize, and the
+        // buffer-change check catches exactly those). The usual FORCE
+        // sources (the ghost fade keeping alpha channels in flight, aim,
+        // focus) would retake EVERY window at full rate for the whole
+        // transition -- the FPS crater. A mid-fade snapshot would bake
+        // partial alpha anyway; keeping the last good one is better.
+        const bool MORPHING = g_viewMorph != EViewMorph::None;
+
+        const bool FORCE = !MORPHING &&
+            (FADING ||
             ALPHA_GRACE ||
             info.id == g_lastAimedId ||
             (g_world.dragActive() && g_world.draggedId() == info.id) ||
             (g_resize.active && g_resize.id == info.id) ||
-            info.id == FOCUSED_ID;
+            info.id == FOCUSED_ID);
 
         bool consumedSkirt = false;
 
@@ -2520,16 +2530,13 @@ static void applyViewMorph(const PHLMONITOR& mon) {
 
     g_morphS = RAW * RAW * (3.0f - 2.0f * RAW);
 
-    // On the way IN the room materializes twice as fast as the windows fly:
-    // Hyprland is still fade-hiding the freshly ghosted 2D windows under the
-    // desktop, and an exposed desktop mid-flight would show them stacked
-    // under the flying quads. The room's opaque environment covers the
-    // desktop before the quads get halfway. (The alpha channels cannot be
-    // forced quiet instead -- they bake into the snapshots.) On the way OUT
-    // the environment follows the flight, as before: the desktop it reveals
-    // shows no windows until the teardown restores them.
-    g_scene.setEnvAlpha(g_viewMorph == EViewMorph::To3D ?
-        smoothstep01(std::min(1.0f, RAW * 2.0f)) : g_morphS);
+    // The room's environment materializes (or dissolves) twice as fast as
+    // the windows fly, both ways -- symmetric. On the way IN that hides the
+    // desktop while Hyprland is still fade-hiding the freshly ghosted 2D
+    // windows (an exposed desktop mid-flight would show them stacked under
+    // the flying quads; the alpha channels cannot be forced quiet instead --
+    // they bake into the snapshots). On the way OUT it mirrors the entrance.
+    g_scene.setEnvAlpha(smoothstep01(std::min(1.0f, RAW * 2.0f)));
 
     applyViewMorphWindows(mon, g_morphS);
 
@@ -2829,6 +2836,7 @@ static void deactivate3D() {
         g_savedCamPos   = CAM.position;
         g_savedCamYaw   = CAM.yaw;
         g_savedCamPitch = CAM.pitch;
+        g_savedViewMode = g_viewMode;
         g_savedCamValid = true;
     }
 
@@ -2836,6 +2844,7 @@ static void deactivate3D() {
     g_viewMorphArmed  = false;
     g_viewMorphWins.clear();
     g_morphS = 1.0f;
+    g_capture.setSkirtDeferred(false);
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
@@ -2934,6 +2943,11 @@ static void enter3D() {
     g_viewMorphArmed  = true;
     g_morphS          = 0.0f;
 
+    // The pre-ghost captures must not pay for silhouette traces: the boxes
+    // are about to be driven by the morph, and the analytic fallback
+    // outlines cover the flight. update3D keeps this in sync per frame.
+    g_capture.setSkirtDeferred(true);
+
     // Player spawn point (config player_spawn): the coordinates are the
     // player's FEET, so spawning at 0,0,0 stands on the grid platform at
     // world zero instead of falling through it. Eyes ride kEyeHeight above.
@@ -2964,9 +2978,11 @@ static void enter3D() {
     resetMovementKeys();
 
     g_grounded = false;
-    g_viewMode = 0;
-    g_scene.camera().mirrorView = false;
-    g_scene.setPlayerVisible(false);
+    // The camera mode (F5: first person / third behind / third front) rides
+    // the same cross-session memory as the camera pose.
+    g_viewMode = g_savedCamValid ? g_savedViewMode : 0;
+    g_scene.camera().mirrorView = g_viewMode == 2;
+    g_scene.setPlayerVisible(g_viewMode != 0);
     g_scene.setPlayerDebugCapsule(Vec3{}, false);
 
     g_keyboardMode = EKeyboardMode::Space;
@@ -3174,6 +3190,14 @@ static void update3D(float dt) {
     g_input.setLookSmoothing(g_cfgLookInertia);
     g_scene.camera().moveSpeed = g_cfgMoveSpeed;
     g_input.setSensitivity(g_cfgSensitivity);
+
+    // Silhouette traces wait while a transition drives the boxes every
+    // frame; the stale/settle cadence re-traces at full resolution on the
+    // first steady frames after it ends.
+    g_capture.setSkirtDeferred(
+        g_viewMorph != EViewMorph::None ||
+        g_fsPhase == EFullscreenPhase::To2D ||
+        g_fsPhase == EFullscreenPhase::To3D);
 
     // Map: the scene owns the file/GL side; collision rebuilds its BVH
     // whenever the map (re)loaded.
