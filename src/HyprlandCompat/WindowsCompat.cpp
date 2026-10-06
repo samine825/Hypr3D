@@ -21,6 +21,18 @@
 
 namespace H3D::Compat {
 
+// The room holds the monitor's ACTIVE workspace (plus its special workspace
+// and pinned windows) -- not every workspace that happens to be visible.
+// During a workspace switch the outgoing workspace still renders while it
+// slides away; picking its windows up ghosted them out of their tiling for
+// a few frames, and the layout re-tiled (resized) them on the way back.
+static bool onRoomWorkspace(const PHLWINDOW& window, const PHLMONITOR& monitor) {
+    const auto WORKSPACE = window->m_workspace;
+
+    return window->m_pinned || WORKSPACE == monitor->m_activeWorkspace ||
+        (WORKSPACE && WORKSPACE == monitor->m_activeSpecialWorkspace);
+}
+
 std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
     std::vector<SWindowInfo> out;
 
@@ -41,7 +53,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
         if (WORKSPACE->m_monitor != monitor)
             continue;
 
-        if (!WORKSPACE->isVisible() && !window->m_pinned && !WORKSPACE->m_forceRendering)
+        if (!onRoomWorkspace(window, monitor))
             continue;
 
         SWindowInfo info;
@@ -148,7 +160,7 @@ bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor) {
     if (WORKSPACE->m_monitor != monitor)
         return false;
 
-    if (!WORKSPACE->isVisible() && !window->m_pinned && !WORKSPACE->m_forceRendering)
+    if (!onRoomWorkspace(window, monitor))
         return false;
 
     return true;
@@ -194,6 +206,13 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     if (!WINDOW || !WINDOW->m_target)
         return;
 
+    // A window closed while the room was open can outlive its unmap (the
+    // close animation keeps the object) with no workspace left; assigning it
+    // a space then crashed in moveToWorkspace, which reads the OLD
+    // workspace (SIGSEGV in CWorkspace::isVisible). Hyprland is done with it.
+    if (!WINDOW->m_isMapped || !WINDOW->m_workspace)
+        return;
+
     if (!save.ghosted) {
         // The window never left the layout: its tree node is alive, its
         // floating flag was never flipped (the room's box drives go through
@@ -221,8 +240,22 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     // target into the layout algorithm.
     WINDOW->m_target->setSpaceGhost(nullptr);
 
-    if (save.space)
-        WINDOW->m_target->assignToSpace(save.space);
+    // The saved space can outlive its workspace: a session lock or a monitor
+    // re-plug tears workspaces down and rebuilds them, and assigning into a
+    // space whose workspace is gone dereferenced it (SIGSEGV in
+    // CWorkspace::isVisible). Fall back to the space of the workspace the
+    // window is on now.
+    SP<Layout::CSpace> SPACE = save.space;
+    if (SPACE) {
+        const auto WS = SPACE->workspace();
+        if (!WS || WS->inert())
+            SPACE = nullptr;
+    }
+    if (!SPACE && WINDOW->m_workspace && !WINDOW->m_workspace->inert())
+        SPACE = WINDOW->m_workspace->m_space;
+
+    if (SPACE)
+        WINDOW->m_target->assignToSpace(SPACE);
     else
         WINDOW->m_target->assignToSpace(nullptr); // force-clear the ghost flag
 

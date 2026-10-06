@@ -38,6 +38,7 @@
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/managers/SessionLockManager.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 
 // This system's lua headers (5.5) lost the extern "C" guard: including them
@@ -1107,6 +1108,9 @@ static bool ownsInput() {
         g_fsPhase != EFullscreenPhase::In2D;
 }
 
+// Defined with the lifecycle code; the frame pump ends 3D on a session lock.
+static void requestDeactivate3D();
+
 static void clearAimFocus() {
     g_aim.reset();
     g_lastFocusId = 0;
@@ -1273,6 +1277,20 @@ static void startFramePump() {
             [](SP<CEventLoopTimer> self, void*) {
                 if (!g_active) {
                     self->updateTimeout(std::nullopt);
+                    return;
+                }
+
+                // A session lock ends 3D at once. While locked Hyprland
+                // draws only the lock surfaces, so a fade would never finish,
+                // and a lock (with the monitor teardown that can follow) is no
+                // time to keep windows ghosted out of their layout. Back in, a
+                // toggle reopens it.
+                if (g_pSessionLockManager &&
+                    g_pSessionLockManager->isSessionLocked()) {
+                    g_transitionTarget = 0.0f;
+                    g_transition       = 0.0f;
+                    requestDeactivate3D();
+                    self->updateTimeout(kFramePumpInterval);
                     return;
                 }
 
