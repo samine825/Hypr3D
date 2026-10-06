@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.27)
 
-project(hypr3d16470 LANGUAGES CXX)
+project(hypr3d15387 LANGUAGES CXX)
 
 # hyprpm and the README run cmake without a build type, which compiled the
 # plugin's own code unoptimised (-O0, only Jolt had -O2); the official
@@ -103,7 +103,7 @@ pkg_check_modules(LIBDRM REQUIRED IMPORTED_TARGET libdrm)
 pkg_check_modules(XKBCOMMON REQUIRED IMPORTED_TARGET xkbcommon)
 pkg_check_modules(HYPRGRAPHICS REQUIRED IMPORTED_TARGET hyprgraphics)
 
-add_library(hypr3d16470 SHARED
+add_library(hypr3d15387 SHARED
     src/main.cpp
     src/Render/GLScene.cpp
     src/Render/MapModel.cpp
@@ -121,7 +121,7 @@ add_library(hypr3d16470 SHARED
     src/HyprlandCompat/PointerHook.cpp
 )
 
-target_include_directories(hypr3d16470
+target_include_directories(hypr3d15387
     BEFORE PRIVATE
         "${HYPRLAND_INCLUDE}"
         "${HYPRLAND_ROOT}"
@@ -130,7 +130,7 @@ target_include_directories(hypr3d16470
         "${CMAKE_CURRENT_SOURCE_DIR}/src"
 )
 
-target_link_libraries(hypr3d16470 PRIVATE
+target_link_libraries(hypr3d15387 PRIVATE
     PkgConfig::HYPRGRAPHICS
     PkgConfig::PIXMAN
     PkgConfig::LIBDRM
@@ -140,7 +140,7 @@ target_link_libraries(hypr3d16470 PRIVATE
     dl
 )
 
-set_target_properties(hypr3d16470 PROPERTIES
+set_target_properties(hypr3d15387 PROPERTIES
     PREFIX ""
-    OUTPUT_NAME "hypr3d16470"
+    OUTPUT_NAME "hypr3d15387"
 )
