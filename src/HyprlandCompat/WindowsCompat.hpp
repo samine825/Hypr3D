@@ -22,6 +22,15 @@ struct SWindowInfo {
     Vector2D       surfaceOffset;   // top-left of the client surface inside monitorLocalBox (border margin)
     Vector2D       surfaceSize;     // client surface size in logical px
     bool           floating = false;
+
+    // Attached surfaces belong to a parent window and are placed relative
+    // to it rather than spawned on their own: a window's xdg popups (menus,
+    // tooltips; `popup` set, `window` empty) and X11 override-redirect
+    // windows (X11 menus; `window` set). parentId is the parent window's id,
+    // 0 when the X server named none.
+    bool                          attached = false;
+    std::uintptr_t                parentId = 0;
+    WP<Desktop::View::CPopup>     popup;
 };
 
 // Enumerate mapped, non-hidden windows that live on a visible workspace of
@@ -135,6 +144,10 @@ void deliverClick(
     bool pressed,
     uint32_t timeMs
 );
+
+// The window owning a popup entity id (nullptr when the id is not a live
+// popup of an eligible window).
+PHLWINDOW findPopupParentById(std::uintptr_t id);
 
 // Layer lookup by entity id (nullptr when the id is not a live layer).
 PHLLS findLayerById(std::uintptr_t id);

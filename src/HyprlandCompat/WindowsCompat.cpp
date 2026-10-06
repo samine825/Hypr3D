@@ -4,6 +4,7 @@
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
+#include <hyprland/src/desktop/view/Popup.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
 #include <hyprland/src/layout/algorithm/Algorithm.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
@@ -69,7 +70,55 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
                 info.surfaceSize))
             continue;
 
+        // X11 menus are override-redirect windows at absolute screen
+        // positions: they belong next to the window they came from.
+        if (window->m_isX11 && window->isX11OverrideRedirect()) {
+            info.attached = true;
+            if (const auto PARENT = window->x11Parent())
+                info.parentId = reinterpret_cast<std::uintptr_t>(PARENT.get());
+        }
+
         out.push_back(std::move(info));
+    }
+
+    // Popups (menus, tooltips) of the windows above: attached surfaces at
+    // their offset from the parent. The head node of each tree is a dummy.
+    const size_t WINDOWS = out.size();
+    for (size_t w = 0; w < WINDOWS; ++w) {
+        const auto WINDOW = out[w].window;
+        if (!WINDOW || !WINDOW->m_popupHead)
+            continue;
+
+        struct SCollect {
+            std::vector<SWindowInfo>* out;
+            PHLMONITOR                monitor;
+            std::uintptr_t            parentId;
+            Desktop::View::CPopup*    head;
+        } COLLECT{&out, monitor, out[w].id, WINDOW->m_popupHead.get()};
+
+        WINDOW->m_popupHead->breadthfirst(
+            [](SP<Desktop::View::CPopup> popup, void* data) {
+                auto* C = static_cast<SCollect*>(data);
+                if (!popup || popup.get() == C->head || !popup->m_mapped ||
+                    !popup->visible())
+                    return;
+
+                const Vector2D SIZE = popup->size();
+                if (SIZE.x <= 0 || SIZE.y <= 0)
+                    return;
+
+                SWindowInfo info;
+                info.id       = reinterpret_cast<std::uintptr_t>(popup.get());
+                info.popup    = popup;
+                info.attached = true;
+                info.parentId = C->parentId;
+                info.monitorLocalBox =
+                    CBox{popup->coordsGlobal() - C->monitor->m_position, SIZE};
+                info.surfaceOffset = Vector2D{0, 0};
+                info.surfaceSize   = SIZE;
+                C->out->push_back(std::move(info));
+            },
+            &COLLECT);
     }
 
     // Layer-shell surfaces (panels, bars, quickshell PanelWindow) live
@@ -410,6 +459,32 @@ bool setWindowBox(const PHLWINDOW& window, const CBox& box) {
     return true;
 }
 
+PHLWINDOW findPopupParentById(std::uintptr_t id) {
+    if (id == 0 || !Desktop::windowState())
+        return nullptr;
+
+    for (const auto& WINDOW : Desktop::windowState()->windows()) {
+        if (!WINDOW || !WINDOW->m_isMapped || !WINDOW->m_popupHead)
+            continue;
+
+        struct SFind {
+            std::uintptr_t id;
+            bool           found = false;
+        } FIND{id};
+        WINDOW->m_popupHead->breadthfirst(
+            [](SP<Desktop::View::CPopup> popup, void* data) {
+                auto* F = static_cast<SFind*>(data);
+                if (popup && reinterpret_cast<std::uintptr_t>(popup.get()) == F->id)
+                    F->found = true;
+            },
+            &FIND);
+        if (FIND.found)
+            return WINDOW;
+    }
+
+    return nullptr;
+}
+
 PHLLS findLayerById(std::uintptr_t id) {
     if (id == 0)
         return nullptr;
@@ -435,6 +510,25 @@ void clearPointerFocus() {
     g_pSeatManager->setPointerFocus(nullptr, {});
 }
 
+// The surface under a point given in the window's surface-local px: one of
+// its open popups (menus are drawn attached to the window, at their real
+// offset, so their hits arrive in the window's space) or the window itself.
+// `local` becomes local to the returned surface.
+static SP<CWLSurfaceResource> surfaceAt(const PHLWINDOW& window, Vector2D& local) {
+    if (window->m_popupHead) {
+        const auto SURF = window->getWindowMainSurfaceBox();
+        const Vector2D GLOBAL = Vector2D{SURF.x, SURF.y} + local;
+        if (const auto POPUP = window->m_popupHead->at(GLOBAL, true);
+            POPUP && POPUP.get() != window->m_popupHead.get()) {
+            if (const auto RES = POPUP->resource()) {
+                local = GLOBAL - POPUP->coordsGlobal();
+                return RES;
+            }
+        }
+    }
+    return window->resource();
+}
+
 void deliverMotion(
     const PHLWINDOW& window,
     const Vector2D& localLogical,
@@ -443,12 +537,13 @@ void deliverMotion(
     if (!window || !g_pSeatManager)
         return;
 
-    const auto SURFACE = window->resource();
+    Vector2D local = localLogical;
+    const auto SURFACE = surfaceAt(window, local);
     if (!SURFACE)
         return;
 
-    g_pSeatManager->setPointerFocus(SURFACE, localLogical);
-    g_pSeatManager->sendPointerMotion(timeMs, localLogical);
+    g_pSeatManager->setPointerFocus(SURFACE, local);
+    g_pSeatManager->sendPointerMotion(timeMs, local);
     g_pSeatManager->sendPointerFrame();
 }
 
@@ -462,7 +557,8 @@ void deliverClick(
     if (!window)
         return;
 
-    const auto SURFACE = window->resource();
+    Vector2D local = localLogical;
+    const auto SURFACE = surfaceAt(window, local);
 
     if (!SURFACE || !g_pSeatManager)
         return;
@@ -471,8 +567,8 @@ void deliverClick(
     // coordinate, then send the button and a frame. The application therefore
     // sees an ordinary Wayland pointer event even though the physical cursor
     // is captured by the 3D view.
-    g_pSeatManager->setPointerFocus(SURFACE, localLogical);
-    g_pSeatManager->sendPointerMotion(timeMs, localLogical);
+    g_pSeatManager->setPointerFocus(SURFACE, local);
+    g_pSeatManager->sendPointerMotion(timeMs, local);
     g_pSeatManager->sendPointerButton(
         timeMs,
         button,

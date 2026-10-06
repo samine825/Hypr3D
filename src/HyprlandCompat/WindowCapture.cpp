@@ -784,6 +784,54 @@ void CWindowCapture::refreshSkirtMaskTiled(std::uintptr_t id, SSnapshot& snapsho
 // decorations: the snapshot is monitor-sized with the layer already in
 // place, so the UV math matches the window path with a zero surface offset.
 // No off-screen pull here -- layers are anchored to the monitor by the shell.
+bool CWindowCapture::makeSnapshotPopup(const WP<Desktop::View::CPopup>& popup,
+                                       const CBox& box, const PHLMONITOR& monitor,
+                                       bool force) {
+    const auto POPUP = popup.lock();
+    if (!POPUP || !monitor || box.w <= 0 || box.h <= 0)
+        return false;
+
+    if (Render::GL::g_pHyprOpenGL)
+        Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+
+    const auto ID = reinterpret_cast<std::uintptr_t>(POPUP.get());
+
+    if (!force) {
+        if (auto IT = m_snapshots.find(ID); IT != m_snapshots.end() &&
+            IT->second.lastBuffer == bufferIdentity(POPUP->resource()) &&
+            boxEquals(IT->second.fullBox, box))
+            return true;
+    }
+
+    // Like a layer: rendered at its own position into a monitor-sized
+    // framebuffer, sampled at its box.
+    auto fb = g_pHyprRenderer->makeSnapshotFB(popup);
+    if (!fb)
+        return false;
+
+    const auto TEXTURE = fb->getTexture();
+
+    SSnapshot snapshot;
+    snapshot.fb     = fb;
+    snapshot.texID  = TEXTURE ? TEXTURE->m_texID : 0;
+    snapshot.width  = TEXTURE ? static_cast<int>(TEXTURE->m_size.x) : 0;
+    snapshot.height = TEXTURE ? static_cast<int>(TEXTURE->m_size.y) : 0;
+
+    if (snapshot.texID == 0 || snapshot.width <= 0 || snapshot.height <= 0)
+        return false;
+
+    snapshot.fullBox       = box;
+    snapshot.sampledBox    = box;
+    snapshot.surfaceOffset = Vector2D{0, 0};
+    snapshot.surfaceSize   = Vector2D{box.w, box.h};
+    snapshot.texSpan       = monitor->m_size;
+    snapshot.lastBuffer    = bufferIdentity(POPUP->resource());
+
+    m_snapshots.erase(ID);
+    m_snapshots.emplace(ID, std::move(snapshot));
+    return true;
+}
+
 bool CWindowCapture::makeSnapshotLayer(const PHLLS& layer, const PHLMONITOR& monitor, bool force) {
     if (!layer || !monitor)
         return false;
