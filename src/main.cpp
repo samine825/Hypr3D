@@ -130,6 +130,12 @@ static std::unordered_set<std::uintptr_t> g_sessionWindows;
 // itself (a mid-session reflow) is left alone -- the tree owns it.
 static std::unordered_set<std::uintptr_t> g_boxDriven;
 
+// Pre-existing windows the fullscreen passthrough flew to the screen while
+// the room was open: the passthrough's own setWindowBox calls force-float
+// them, and the exit must flip the flag back (user-initiated floats are not
+// in the set and stay).
+static std::unordered_set<std::uintptr_t> g_flagFloated;
+
 // --- 2D/3D independent positions + the view morph ---------------------------
 //
 // Positions are per-mode. The desktop keeps its own layout (ghosting
@@ -1191,8 +1197,17 @@ static void unghostWindows() {
     // their saved spots (see restoreWindowLayout); the settle pass then
     // recalculates once and pins the exact saved boxes -- pinning earlier
     // would be overridden by the following windows' insertion recalcs.
-    for (auto& save : g_layoutSaves)
+    for (auto& save : g_layoutSaves) {
         Compat::restoreWindowLayout(save);
+
+        // The fullscreen passthrough force-floats the window it flew to the
+        // screen; a pre-existing tiled window must return to its tile.
+        // User-initiated floats during the session are not in the set.
+        if (g_flagFloated.count(save.id) && !save.wasFloating)
+            if (auto W = save.window.lock(); W && W->m_target &&
+                                             W->m_target->floating())
+                W->m_target->setFloating(false);
+    }
 
     Compat::restoreWindowLayoutSettle(g_layoutSaves);
 
@@ -1737,9 +1752,12 @@ static Vector2D localFromHit(const World3D::SHit& hit) {
     const float Y = std::clamp(hit.v, 0.0f, 1.0f) * ENTITY->logicalHeight -
         ENTITY->surfaceOffsetY;
 
+    // surfaceWidth/Height can go negative for degenerate boxes (a window
+    // mid-map with a border offset larger than the box); a hardened
+    // std::clamp aborts on lo > hi, so the bounds are floored at zero.
     return {
-        std::clamp(X, 0.0f, ENTITY->surfaceWidth),
-        std::clamp(Y, 0.0f, ENTITY->surfaceHeight),
+        std::clamp(X, 0.0f, std::max(0.0f, ENTITY->surfaceWidth)),
+        std::clamp(Y, 0.0f, std::max(0.0f, ENTITY->surfaceHeight)),
     };
 }
 
@@ -1871,8 +1889,10 @@ static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
     const auto MIN = g_resize.window->minSize().value_or(Vector2D{1.0, 1.0});
     const auto MAX = g_resize.window->maxSize().value_or(Vector2D{INFINITY, INFINITY});
 
-    out.w = std::clamp(out.w, MIN.x, MAX.x);
-    out.h = std::clamp(out.h, MIN.y, MAX.y);
+    // A client may report min > max; a hardened std::clamp aborts on an
+    // inverted range, so the bounds are sorted first.
+    out.w = std::clamp(out.w, std::min(MIN.x, MAX.x), std::max(MIN.x, MAX.x));
+    out.h = std::clamp(out.h, std::min(MIN.y, MAX.y), std::max(MIN.y, MAX.y));
 
     if (g_resize.edgeX > 0)
         out.x = start.x;
@@ -1911,6 +1931,15 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
         return; // not in the room: nothing to animate
 
     g_fsWindow = window;
+
+    // A pre-existing window fullscreened while the room is open: the
+    // passthrough and its restore drive the REAL box and force-float the
+    // window. The exit morph animates the box back to the saved 2D box, and
+    // the exit's restore flips the flag back.
+    if (g_sessionWindows.count(Compat::windowId(window))) {
+        g_boxDriven.insert(Compat::windowId(window));
+        g_flagFloated.insert(Compat::windowId(window));
+    }
 
     // The floating box: the POSITION from the stable memory (where the
     // window lived), the SIZE from Hyprland's own remembered floating size.
@@ -2899,6 +2928,7 @@ static void deactivate3D() {
     g_viewMorphWins.clear();
     g_morphS = 1.0f;
     g_boxDriven.clear();
+    g_flagFloated.clear();
     g_sessionWindows.clear();
     g_capture.setSkirtDeferred(false);
 
@@ -2967,6 +2997,19 @@ static void enter3D() {
     // nothing at all.
     g_active = true;
     startFramePump();
+
+    // A rapid toggle off->on can skip the deferred teardown: its doLater
+    // finds the room already reopened and bails. Heal whatever that left --
+    // ghosted windows go back to the layout and the session bookkeeping
+    // resets -- or the new session inherits stale layout saves and drives
+    // windows to boxes from a previous session.
+    if (g_ghosted)
+        unghostWindows();
+    g_layoutSaves.clear();
+    g_sessionWindows.clear();
+    g_boxDriven.clear();
+    g_flagFloated.clear();
+    g_ghosted = false;
 
     // Hide the host cursor: the 3D view aims with its own crosshair. Client
     // cursor updates are gated by the hooks; the client re-applies its own
