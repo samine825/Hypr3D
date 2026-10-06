@@ -6,6 +6,7 @@
 #include "World/Outline.hpp"
 #include "World/Picking.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <filesystem>
 #include <memory>
@@ -17,6 +18,9 @@ namespace H3D {
 // The vertical field of view of the 3D view, in degrees. Shared with
 // main.cpp (fullscreen transition computes the screen-filling quad from it).
 static constexpr float kFovDeg = 65.0f;
+
+// Vertex count of the typing-mode cursor arrow (five triangles).
+static constexpr int kPointerVerts = 15;
 
 // The 3D view: a first-person room containing the windows of the active
 // workspace. It deliberately knows nothing about Hyprland -- main.cpp feeds it
@@ -97,6 +101,44 @@ class GLScene {
         m_debugOverlay = on;
     }
 
+    // Hidden while the typing mode frees the real cursor.
+    void setCrosshairVisible(bool on) {
+        m_crosshairVisible = on;
+    }
+
+    // The typing-mode cursor (an arrow). On a window it lies in the window's
+    // plane: the tip sits at a world point and one cursor pixel spans
+    // pxWorld units along the window's right/down axes, so it shares the
+    // window's perspective. Off windows it is drawn flat at a viewport point.
+    struct SPointer {
+        enum class EMode : uint8_t { Hidden, World, Screen };
+
+        EMode mode = EMode::Hidden;
+        Vec3  tip{};
+        Vec3  right{};
+        Vec3  down{};
+        float pxWorld = 0.0f;
+        float ndcX    = 0.0f; // Screen: tip in normalized device coords
+        float ndcY    = 0.0f;
+
+        // The client's own cursor image (premultiplied RGBA). Unset draws
+        // the built-in arrow. Sizes are in cursor pixels, the hotspot is
+        // where the tip/point lands.
+        unsigned int texture = 0;
+        float        texW    = 0.0f;
+        float        texH    = 0.0f;
+        float        hotX    = 0.0f;
+        float        hotY    = 0.0f;
+    };
+
+    void setPointer(const SPointer& pointer) {
+        m_pointer = pointer;
+    }
+
+    float zoom() const {
+        return m_zoom;
+    }
+
     void setDebugFps(float fps) {
         m_debugFps = fps;
     }
@@ -112,6 +154,16 @@ class GLScene {
     // symmetrically around the crosshair, so aiming stays exact.
     void setZoom(float magnification) {
         m_zoom = magnification > 0.01f ? magnification : 0.01f;
+    }
+
+    // Environment visibility for the 2D<->3D view morph: 1 = the room fully
+    // drawn (steady state), 0 = windows only over a transparent scene
+    // buffer (the 2D desktop beneath shows through everywhere the window
+    // quads do not cover). While below 1 the scene pass switches to a
+    // premultiplied per-pixel composite: the environment fades as one, the
+    // window quads stay fully opaque from the first morph frame.
+    void setEnvAlpha(float a) {
+        m_envAlpha = std::clamp(a, 0.0f, 1.0f);
     }
 
     // The player's own character (player.mesh). The SAME mesh description
@@ -242,8 +294,13 @@ class GLScene {
     void refreshPanorama();
 
     void drawWindows(const Mat4& vp, const std::vector<WindowRender>& windows);
-    void drawFullscreen(float alpha);
+    void drawFullscreen(float alpha, bool perPixel);
     void drawCrosshair(int width, int height);
+    void drawPointer(const Mat4& vp, int width, int height);
+
+    // Fullscreen NDC quad in the SCENE program's layout (pos3+uv2): the
+    // environment fade multiplies the scene buffer in place.
+    void drawEnvFade(float a);
 
   private:
     bool m_initialized = false;
@@ -281,17 +338,24 @@ class GLScene {
     unsigned int m_fullscreenVAO = 0;
     unsigned int m_fullscreenVBO = 0;
 
+    unsigned int m_fadeVAO = 0;
+    unsigned int m_fadeVBO = 0;
+
     unsigned int m_crosshairVAO = 0;
     unsigned int m_crosshairVBO = 0;
+    unsigned int m_pointerVAO   = 0;
+    unsigned int m_pointerVBO   = 0;
 
     int m_sceneMVP = -1;
     int m_sceneTexture = -1;
     int m_sceneTextured = -1;
     int m_sceneColorUniform = -1;
     int m_sceneUVRect = -1;
+    int m_scenePremult = -1;
 
     int m_blitTexture = -1;
     int m_blitAlpha = -1;
+    int m_blitPerPx = -1;
 
     int m_panoramaFwd = -1;
     int m_panoramaRight = -1;
@@ -316,8 +380,15 @@ class GLScene {
 
     float m_time = 0.0f;
 
+    // 2D<->3D view morph: environment visibility (1 = steady room) and the
+    // window pipeline mode it selects. See setEnvAlpha.
+    float m_envAlpha = 1.0f;
+    bool  m_windowsPremultiplied = false;
+
     // F3 debug HUD state.
     bool                            m_debugOverlay = false;
+    bool                            m_crosshairVisible = true;
+    SPointer                        m_pointer;
     bool                            m_gridVisible  = true;
     float                           m_zoom         = 1.0f;
     CPlayerModel                    m_player;

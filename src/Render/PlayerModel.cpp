@@ -538,6 +538,12 @@ std::vector<float> CPlayerModel::buildVerts(const SPrim& P) const {
     const bool SKINNED = P.skin >= 0 &&
         P.skin < static_cast<int>(m_skinMats.size()) && !P.joints.empty();
     const Mat4 W = m_world[P.node];
+    // The space the skin's bind expects (see load()): a spec export skins
+    // the raw vertex, without the mesh node's world.
+    const bool MESH_WORLD = !SKINNED ||
+        P.skin >= static_cast<int>(m_skinMeshWorld.size()) ||
+        m_skinMeshWorld[P.skin];
+    const Mat4 BIND = MESH_WORLD ? W : Mat4::identity();
 
     std::vector<float> buf;
     buf.reserve(static_cast<size_t>(NV) * 8);
@@ -561,10 +567,10 @@ std::vector<float> CPlayerModel::buildVerts(const SPrim& P) const {
                     for (int c = 0; c < 16; ++c)
                         M.m[c] += WK * JM.m[c];
                 }
-                POS = transformPoint(M, transformPoint(W, {
+                POS = transformPoint(M, transformPoint(BIND, {
                     P.basePos[v * 3 + 0], P.basePos[v * 3 + 1],
                     P.basePos[v * 3 + 2]}));
-                NRM = transformDir(M, transformDir(W, {
+                NRM = transformDir(M, transformDir(BIND, {
                     P.baseNrm[v * 3 + 0], P.baseNrm[v * 3 + 1],
                     P.baseNrm[v * 3 + 2]}));
             } else {
@@ -1011,6 +1017,33 @@ bool CPlayerModel::load(const std::string& path) {
 
     m_loaded = true;
     evaluateNodes(); // rest pose for the first frame
+
+    // Which space the inverse bind matrices expect, per skin. glTF says the
+    // skinned mesh node's transform is ignored: at rest jointWorld * invBind
+    // is the identity and vertices go straight through the palette (Blender
+    // and Mixamo exports, where the mesh sits under a 0.01-scaled armature).
+    // Some exports bake the mesh node's world into the bind instead; those
+    // keep the mesh-world-first path. Applying the mesh world to a spec
+    // export scaled every vertex by the armature twice and collapsed it onto
+    // its joints (membranes stretched between the bones).
+    m_skinMeshWorld.assign(m_skins.size(), true);
+    for (size_t s = 0; s < m_skins.size(); ++s) {
+        const auto& SK = m_skins[s];
+        if (SK.joints.empty() || SK.invBind.empty())
+            continue;
+        const int N = SK.joints[0];
+        if (N < 0 || N >= static_cast<int>(m_world.size()))
+            continue;
+
+        const Mat4 REST = m_world[N] * SK.invBind[0];
+        const Mat4 I    = Mat4::identity();
+        bool identity   = true;
+        for (int c = 0; c < 16; ++c)
+            if (std::fabs(REST.m[c] - I.m[c]) > 1e-3f)
+                identity = false;
+        m_skinMeshWorld[s] = !identity;
+    }
+
     return true;
 }
 
@@ -1077,7 +1110,9 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
             const auto& JM = m_skinMats[P.skin];
             const int COUNT = std::min<size_t>(JM.size(), MAX_JOINTS);
             glUniform1i(m_uSkinned, COUNT ? 1 : 0);
-            const Mat4& W = m_world[P.node];
+            const bool MESH_WORLD = P.skin < static_cast<int>(m_skinMeshWorld.size()) &&
+                m_skinMeshWorld[P.skin];
+            const Mat4 W = MESH_WORLD ? m_world[P.node] : Mat4::identity();
             glUniformMatrix4fv(m_uMeshWorld, 1, GL_FALSE, W.m.data());
             if (COUNT)
                 glUniformMatrix4fv(m_uJoints, COUNT, GL_FALSE,

@@ -38,6 +38,9 @@
 #include <hyprland/src/pointer/PointerManager.hpp>
 #include <hyprland/src/pointer/PointerController.hpp>
 #include <hyprland/src/state/MonitorState.hpp>
+#include <hyprland/src/managers/SessionLockManager.hpp>
+#include <hyprland/src/render/Texture.hpp>
+#include <hyprland/src/protocols/core/Compositor.hpp>
 #include <hyprutils/memory/UniquePtr.hpp>
 
 // This system's lua headers (5.5) lost the extern "C" guard: including them
@@ -56,6 +59,7 @@ extern "C" {
 #include "Input/AimFocus.hpp"
 #include "Input/InputController.hpp"
 #include "World/MapCollision.hpp"
+#include "World/ScreenProject.hpp"
 #include "World/World3D.hpp"
 #include "HyprlandCompat/WindowsCompat.hpp"
 #include "HyprlandCompat/FocusCompat.hpp"
@@ -74,6 +78,7 @@ extern "C" {
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace H3D {
@@ -117,6 +122,91 @@ static bool g_reportedPointerHookError = false;
 // layout's control.
 static std::vector<Compat::SWindowLayoutSave> g_layoutSaves;
 static bool g_ghosted = false;
+
+// The windows that were already mapped when 3D opened. They keep their live
+// layout membership for the whole session (the tiling tree survives
+// untouched); only the fullscreen window (ghosted at enter3D) and windows
+// that map while the view is open leave the layout.
+static std::unordered_set<std::uintptr_t> g_sessionWindows;
+
+// Windows whose real box the room drove THIS session (the enter morph's
+// drive to the remembered room box, and 3D resizes). The exit morph animates
+// exactly these back to their saved 2D boxes; a box changed by the layout
+// itself (a mid-session reflow) is left alone -- the tree owns it.
+static std::unordered_set<std::uintptr_t> g_boxDriven;
+
+// The room box (monitor-local) of every room window, frozen at enter. While
+// the room is open the enforcer in update3D holds windows on these boxes:
+// the 2D layout and the room are separate universes -- a tree reflow, a
+// floating recalc, a remembered-size restore, none of them may move the 3D
+// arrangement. Floating windows the room never drove are exempt (their box
+// is live, client resizes stay visible).
+static std::unordered_map<std::uintptr_t, CBox> g_roomBoxes;
+
+// Pre-existing windows the fullscreen passthrough flew to the screen while
+// the room was open: the passthrough's own setWindowBox calls force-float
+// them, and the exit must flip the flag back (user-initiated floats are not
+// in the set and stay).
+static std::unordered_set<std::uintptr_t> g_flagFloated;
+
+// --- 2D/3D independent positions + the view morph ---------------------------
+//
+// Positions are per-mode. The desktop keeps its own layout (ghosting
+// restores it exactly), and the room remembers where every window was
+// dragged: on the next toggle each window returns to ITS pose instead of
+// spawning at zero. Toggling itself is not a fade: every window's 2D
+// rectangle is back-projected onto the camera frustum plane -- the pose
+// where the quad covers its on-screen spot EXACTLY (the fullscreen
+// passthrough construction, generalized to every window) -- and the quad
+// flies from there to the room pose, while the environment fades in
+// per-pixel. No visible jump at either handoff.
+struct SViewPose {
+    Vec3  center{};
+    float yaw   = 0.f;
+    float pitch = 0.f;
+    float roll  = 0.f;
+
+    // The window's real box as it lived in the ROOM (monitor-local px).
+    // Sizes are per-mode: on entry the morph drives the real box here (the
+    // client re-renders at the room's size -- crisp content), on exit back
+    // to the 2D box. Empty = never sized in the room.
+    CBox box{};
+};
+
+// Room poses remembered across toggles; keyed by window id, pruned against
+// the live room on every save (closed windows drop out).
+static std::unordered_map<std::uintptr_t, SViewPose> g_savedPoses;
+
+enum class EViewMorph : uint8_t { None, To3D, To2D };
+static EViewMorph g_viewMorph = EViewMorph::None;
+
+// Per-window morph endpoints, captured once when the morph starts. The
+// room never ghosts pre-existing windows, so the layout owns the real
+// geometry in both modes; the morph's box animation drives the real box
+// between the 2D box and the remembered room box ONLY for windows whose
+// two differ (a 3D resize) -- the client re-renders along the way, so the
+// content inside the quad never jumps scale, and the tree node underneath
+// is untouched (flag flips only, no algorithm bookkeeping).
+struct SViewMorphWin {
+    CBox      box2D{};    // monitor-local: the 2D rect covered at s=0
+    CBox      boxRoom{};  // monitor-local: the room's real box at s=1
+    SViewPose roomPose{}; // the room pose at s=1
+    bool      animBox = false; // drive the real box between the two
+    float     stack   = 0.f;   // world units toward the eye (2D stacking)
+};
+static std::unordered_map<std::uintptr_t, SViewMorphWin> g_viewMorphWins;
+
+// Enter morph waits for the first captures: the takeoff pose must show the
+// 2D content, so the pre-ghost snapshots have to exist before the table is
+// built (see serviceCapture).
+static bool g_viewMorphArmed = false;
+
+// Eased morph progress this frame (1 = the room). Diagnostics.
+static float g_morphS = 1.0f;
+
+// Coplanar 2D rectangles keep a stacking order by sitting this much closer
+// to the eye per list layer (~1 px of projection error, invisible).
+static constexpr float kMorphStackEps = 0.012f;
 
 // What to draw this frame, rebuilt once per frame from the world.
 static std::vector<GLScene::WindowRender> g_renderWindows;
@@ -274,11 +364,19 @@ static constexpr float kFsAnimDuration = 0.6f;
 static void pollFullscreen();
 static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox = true);
 
+// The 2D<->3D view morph (built once the first pre-ghost captures exist).
+static void buildEnterMorph(
+    const PHLMONITOR& mon, const std::vector<Compat::SWindowInfo>& infos);
+
 // Windows that appear while the view is open spawn as floating panels of
 // this logical size (see ghostWindows), and enter the room this far in front
 // of the camera, facing it.
-static constexpr float kSpawnWidth    = 960.0f;
-static constexpr float kSpawnHeight   = 540.0f;
+// windows.spawn_size: the logical box a window that appears while the view
+// is open starts at (see ghostWindows). A larger box with a smaller
+// window_scale gives the same panel in the room with more pixels (sharper,
+// more content), as if the window were further away.
+static float      g_cfgSpawnWidth  = 960.0f;
+static float      g_cfgSpawnHeight = 540.0f;
 static constexpr float kSpawnDistance = 10.0f;
 
 // A normal damage cycle stops when nothing else in Hyprland changes. 3D mode is
@@ -294,7 +392,21 @@ static constexpr auto kFramePumpInterval = std::chrono::milliseconds(8);
 // windows (Super+LMB), resizes (Super+RMB) and clicks through to clients.
 enum class EKeyboardMode : uint8_t { Space, Window };
 static EKeyboardMode g_keyboardMode = EKeyboardMode::Space;
+
+// input.typing_cursor: window (typing) mode also frees the pointer and gives
+// it a cursor on the windows. Off, window mode only redirects the keyboard
+// and the mouse keeps steering the camera.
+static bool     g_cfgTypingCursor = false;
+// input.typing_button: a mouse button (evdev code) that toggles window mode,
+// 0 = none.
+static uint32_t g_cfgTypingButton = 0;
 static bool          g_altHeld      = false;
+
+// The free cursor was last seen over the room (see onMouseMove).
+static bool g_freeOnRoom = false;
+
+// A press that switched modes; its release is swallowed too.
+static uint32_t g_swallowRelease = 0;
 
 // Camera movement keys, set only while the 3D view owns the keyboard.
 static bool g_keyFwd = false;
@@ -314,7 +426,14 @@ static bool g_hookInstalled = false;
 // --- world ------------------------------------------------------------------
 static std::string g_cfgPanorama;                // panorama image path
 static std::string g_cfgMonitor;                 // monitor name (e.g. "DP-1"), empty = focused
-static bool        g_cfgGrid = true;             // base grid platform on/off
+static bool        g_cfgGrid = true;
+// world.under_layers: draw the room under the top and overlay layers (bars,
+// launchers, notifications stay 2D on top and take input) instead of over
+// everything.
+// Default ON: bars/launchers/notifications (Quickshell, Waybar, ...) stay
+// ordinary 2D surfaces over the room instead of becoming 3D panels. Set
+// world.under_layers = false to return to panels-in-the-room.
+static bool        g_cfgUnderLayers = true;
 
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
@@ -336,6 +455,16 @@ static float        g_playerAnimSpeed[4] = {1.f, 1.f, 1.f, 1.f};
 // Feet position; eyes ride kEyeHeight above (spawn 0,0,0 = standing on
 // the grid platform at world zero).
 static Vec3 g_playerSpawn{0.0f, 0.0f, 0.0f};
+
+// The camera pose remembered across 3D sessions: the player's position is
+// kept (the physics body survives the toggle and pulls the camera back),
+// and the look angles must be remembered explicitly -- they would otherwise
+// reset to the spawn orientation on every entry.
+static Vec3  g_savedCamPos{};
+static float g_savedCamYaw   = 0.0f;
+static float g_savedCamPitch = 0.0f;
+static int   g_savedViewMode = 0; // F5 camera mode (0 first, 1/2 third)
+static bool  g_savedCamValid = false;
 
 // Walking physics state (grounded comes from the Jolt body's ground ray).
 static bool g_grounded = false;
@@ -806,11 +935,18 @@ static void joltSyncBodies() {
                 }
 
                 // Dynamic/kinematic bodies use a convex hull (Jolt requires
-                // it; the hull also tumbles believably).
+                // it; the hull also tumbles believably). Dense meshes are
+                // sampled down first: hulling every vertex of a ~2M-triangle
+                // model (6M points) stalled the compositor, and a hull of a
+                // few tens of thousands of points looks the same.
+                constexpr size_t MAX_HULL_TRIS = 20000;
+                const size_t STRIDE =
+                    std::max<size_t>(1, LOCAL.size() / MAX_HULL_TRIS);
+
                 JPH::Array<JPH::Vec3> POINTS;
-                POINTS.reserve(LOCAL.size() * 3);
-                for (const auto& T : LOCAL)
-                    for (const Vec3* P : {&T.a, &T.b, &T.c}) {
+                POINTS.reserve((LOCAL.size() / STRIDE + 1) * 3);
+                for (size_t t = 0; t < LOCAL.size(); t += STRIDE)
+                    for (const Vec3* P : {&LOCAL[t].a, &LOCAL[t].b, &LOCAL[t].c}) {
                         const Vec3 Q = BODY_PT(*P);
                         POINTS.push_back(JPH::Vec3(Q.x, Q.y, Q.z));
                     }
@@ -967,6 +1103,13 @@ static uint64_t g_diagWarpCalls   = 0;
 static Vector2D g_diagWarpAfter{};
 static Vector2D g_diagMgrPos{};
 
+// Real-resize drive tracking: whether updateRealResize actually drove the
+// box, and what it drove. A stalled counter with the gesture active means
+// the gesture path never reaches the drive; a counter that grows with a
+// pinned box means the client's min/max clamps eat the resize.
+static uint64_t g_diagResizeDrives  = 0;
+static CBox     g_diagLastResizeBox{};
+
 // How far (logical px) the cursor may stray from the crosshair before it is
 // warped back. Declared with the other diagnostics so the dump and the code
 // that uses it cannot drift apart.
@@ -1012,6 +1155,7 @@ static void damageCurrentMonitor() {
 }
 
 static PHLMONITOR g_currentRenderMon = nullptr;
+static bool       g_roomDrawnThisFrame = false; // see onRenderStage
 
 // The monitor the 3D view is built for: configured monitor, or focused monitor,
 // falling back to whatever render.pre last reported.
@@ -1062,6 +1206,47 @@ static bool ownsInput() {
         g_fsPhase != EFullscreenPhase::In2D;
 }
 
+// Defined with the lifecycle code; the frame pump ends 3D on a session lock.
+static void requestDeactivate3D();
+// Window (typing) mode frees the pointer: the camera freezes, the real cursor
+// comes back and can leave for the other monitors. Space mode captures it
+// again behind the crosshair.
+static bool pointerFree() {
+    return g_cfgTypingCursor && g_keyboardMode == EKeyboardMode::Window;
+}
+
+// Typing-mode virtual cursor state; see the block above onRenderStage.
+enum class ECursorSpace : uint8_t { Desktop, Screen, Window };
+
+static ECursorSpace   g_vcSpace = ECursorSpace::Desktop;
+static Vector2D       g_vcScreen{}; // room-monitor-local logical px
+static std::uintptr_t g_vcId = 0;   // Window: the entity under the cursor
+static Vector2D       g_vcLocal{};  // Window: decorated-box px, top-left origin
+
+static bool virtualCursor() {
+    return pointerFree() && g_hookInstalled;
+}
+
+// Whether the hook should swallow pointer motion right now.
+static bool captureWanted() {
+    if (!g_hookInstalled || !ownsInput())
+        return false;
+
+    return !pointerFree() || g_vcSpace != ECursorSpace::Desktop;
+}
+
+static void vcMove(double dx, double dy);
+static void refreshCursorImage();
+static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
+                              Vector2D& hotspot);
+
+// Whether a global logical point lies on the monitor the room is drawn on.
+static bool onRoomMonitor(const Vector2D& pos) {
+    const auto MON = targetMonitor();
+
+    return MON && CBox{MON->m_position, MON->m_size}.containsPoint(pos);
+}
+
 static void clearAimFocus() {
     g_aim.reset();
     g_lastFocusId = 0;
@@ -1075,28 +1260,56 @@ static void clearAimFocus() {
 // triggers a relayout of the ones still attached, which would corrupt boxes
 // captured afterwards. Ghosting is what stops tiling from managing windows
 // while they are living in 3D space.
-static void ghostWindows(const PHLMONITOR& mon) {
+static void ghostWindows(
+    const PHLMONITOR& mon,
+    const std::vector<Compat::SWindowInfo>* infos = nullptr) {
     if (!mon)
         return;
 
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    // Callers that have already enumerated (the capture pass) pass the list
+    // in; the rest enumerate here, as before.
+    std::vector<Compat::SWindowInfo> enumerated;
+    const std::vector<Compat::SWindowInfo>* list = infos;
+
+    if (!list) {
+        enumerated = Compat::enumerateEligibleWindows(mon, g_cfgUnderLayers);
+        list       = &enumerated;
+    }
+
+    const auto& LIST = *list;
 
     if (!g_ghosted) {
-        // First pass: save EVERY window before ghosting any of them, since
-        // ghosting one window triggers a relayout of the ones still attached,
-        // which would corrupt boxes captured afterwards.
-        g_layoutSaves.clear();
-        g_layoutSaves.reserve(INFOS.size());
+        // The windows that were already mapped when 3D opened KEEP their
+        // live layout membership: the tiling tree survives the session
+        // untouched, so the 2D arrangement after the exit is the original
+        // one -- exact, with nothing to reconstruct. Their geometry is only
+        // REMEMBERED here (the exit morph animates a 3D-resized window's
+        // real box back to it). The fullscreen window was already saved and
+        // ghosted at enter3D; everything else is saved without ghosting.
+        g_layoutSaves.reserve(g_layoutSaves.size() + LIST.size());
+        g_sessionWindows.clear();
 
-        for (const auto& info : INFOS) {
+        for (const auto& info : LIST) {
+            g_sessionWindows.insert(info.id);
+
+            bool saved = false;
+            for (const auto& SAVE : g_layoutSaves)
+                if (SAVE.id == info.id) {
+                    saved = true;
+                    break;
+                }
+
+            if (saved)
+                continue; // the fullscreen window, handled at enter3D
+
+            if (info.attached)
+                continue; // popups and X11 menus are no layout targets
+
             auto SAVE = Compat::saveWindowLayout(info.window);
 
             if (SAVE.window)
                 g_layoutSaves.push_back(std::move(SAVE));
         }
-
-        for (auto& save : g_layoutSaves)
-            Compat::applyWindowGhost(save);
 
         g_ghosted = true;
         return;
@@ -1107,18 +1320,12 @@ static void ghostWindows(const PHLMONITOR& mon) {
     // live layout target and every later spawn or close re-tiles the space
     // around it. The live weak reference guards against a new window reusing
     // a closed one's address.
-    for (const auto& info : INFOS) {
-        bool known = false;
+    for (const auto& info : LIST) {
+        if (info.attached)
+            continue; // popups and X11 menus: no spawn, no ghost, no seeds
 
-        for (const auto& save : g_layoutSaves) {
-            if (save.id == info.id && !save.window.expired()) {
-                known = true;
-                break;
-            }
-        }
-
-        if (known)
-            continue;
+        if (g_sessionWindows.count(info.id))
+            continue; // was mapped at entry: keeps its layout membership
 
         // A window that appears while the view is open becomes a small
         // floating panel instead of a fullscreen tile -- resized BEFORE the
@@ -1126,25 +1333,40 @@ static void ghostWindows(const PHLMONITOR& mon) {
         // user actually worked with. setWindowBox takes GLOBAL layout
         // coordinates: centre on this monitor, not on the layout origin
         // (which belongs to whichever monitor sits at 0,0, or none at all).
-        if (info.window) {
+        // A dialog (a window with a parent) keeps the size it asked for.
+        if (info.window && !info.window->parent()) {
             const double CX =
-                mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
+                mon->m_position.x + mon->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
             const double CY =
-                mon->m_position.y + mon->m_size.y * 0.5 - kSpawnHeight * 0.5;
+                mon->m_position.y + mon->m_size.y * 0.5 - g_cfgSpawnHeight * 0.5;
 
             Compat::setWindowBox(
                 info.window,
-                CBox{CX, CY, kSpawnWidth, kSpawnHeight}
+                CBox{CX, CY, g_cfgSpawnWidth, g_cfgSpawnHeight}
             );
+
+            // The ghost is room-driven: the enforcer holds its spawn box,
+            // and the ghost-toggle fixup (update3D) can find it in the
+            // driven set.
+            g_roomBoxes[info.id] =
+                CBox{CX - mon->m_position.x, CY - mon->m_position.y,
+                     g_cfgSpawnWidth, g_cfgSpawnHeight};
+            g_boxDriven.insert(info.id);
         }
 
         auto SAVE = Compat::saveWindowLayout(info.window);
 
         if (!SAVE.window)
-            continue;
+            continue; // transient: retried on the next tick
 
         Compat::applyWindowGhost(SAVE);
         g_layoutSaves.push_back(std::move(SAVE));
+
+        // Mark processed: without this the branch re-runs EVERY tick --
+        // setWindowBox(spawn) reverts the box the user is resizing, the
+        // room-box seed reverts with it, and g_layoutSaves grows by a
+        // duplicate save per tick for the whole session.
+        g_sessionWindows.insert(info.id);
     }
 }
 
@@ -1154,8 +1376,23 @@ static void unghostWindows() {
 
     // Force the exact saved geometry back, so leaving 3D never disturbs the
     // user's 2D arrangement. The 3D arrangement is a view, not an edit.
-    for (auto& save : g_layoutSaves)
+    // Tiled windows are re-inserted into the layout algorithm's tree at
+    // their saved spots (see restoreWindowLayout); the settle pass then
+    // recalculates once and pins the exact saved boxes -- pinning earlier
+    // would be overridden by the following windows' insertion recalcs.
+    for (auto& save : g_layoutSaves) {
         Compat::restoreWindowLayout(save);
+
+        // The fullscreen passthrough force-floats the window it flew to the
+        // screen; a pre-existing tiled window must return to its tile.
+        // User-initiated floats during the session are not in the set.
+        if (g_flagFloated.count(save.id) && !save.wasFloating)
+            if (auto W = save.window.lock(); W && W->m_target &&
+                                             W->m_target->floating())
+                W->m_target->setFloating(false);
+    }
+
+    Compat::restoreWindowLayoutSettle(g_layoutSaves);
 
     g_layoutSaves.clear();
     g_ghosted = false;
@@ -1183,6 +1420,20 @@ static void startFramePump() {
             [](SP<CEventLoopTimer> self, void*) {
                 if (!g_active) {
                     self->updateTimeout(std::nullopt);
+                    return;
+                }
+
+                // A session lock ends 3D at once. While locked Hyprland
+                // draws only the lock surfaces, so a fade would never finish,
+                // and a lock (with the monitor teardown that can follow) is no
+                // time to keep windows ghosted out of their layout. Back in, a
+                // toggle reopens it.
+                if (g_pSessionLockManager &&
+                    g_pSessionLockManager->isSessionLocked()) {
+                    g_transitionTarget = 0.0f;
+                    g_transition       = 0.0f;
+                    requestDeactivate3D();
+                    self->updateTimeout(kFramePumpInterval);
                     return;
                 }
 
@@ -1232,7 +1483,21 @@ static void refreshCaptures(
     const auto FOCUSED = Compat::focusedWindow();
     const std::uintptr_t FOCUSED_ID = FOCUSED ? Compat::windowId(FOCUSED) : 0;
 
+    // During the view morph every driven window's real box changes each
+    // frame, defeating the unchanged-box skip inside makeSnapshot: each
+    // retake is a full fake render into a monitor-sized framebuffer -- the
+    // transition FPS crater with several windows in flight. Cap the retakes
+    // per pass and rotate the budget so every window eventually refreshes.
+    // Quad sizes follow the snapshots, so they step instead of gliding --
+    // invisible at flight speed, and the first ungated pass after the morph
+    // lands the exact final boxes.
+    static size_t    morphCaptureCursor = 0;
+    constexpr size_t MORPH_RETAKE_BUDGET = 2;
+    const bool       MORPHING = g_viewMorph != EViewMorph::None;
+
     bool consumedSkirt = false;
+
+    size_t index = 0;
 
     for (const auto& info : infos) {
         // Focus-change feedback (the active/inactive opacity fade and the
@@ -1275,29 +1540,57 @@ static void refreshCaptures(
         const bool ALPHA_GRACE = info.window &&
             alphaGrace.count(info.id) > 0;
 
-        const bool FORCE =
-            FADING ||
+        // During the view morph the quads' content is static (the room
+        // never drives the real boxes), so nothing needs retakes. The usual
+        // FORCE sources (the ghost fade keeping alpha channels in flight,
+        // aim, focus) would retake EVERY window at full rate for the whole
+        // transition -- the FPS crater. A mid-fade snapshot would bake
+        // partial alpha anyway; keeping the last good one is better.
+        const bool FORCE = !MORPHING &&
+            (FADING ||
             ALPHA_GRACE ||
             info.id == g_lastAimedId ||
             (g_world.dragActive() && g_world.draggedId() == info.id) ||
-            (g_resize.active && g_resize.id == info.id) ||
-            info.id == FOCUSED_ID;
-
-        bool consumedSkirt = false;
+            (g_pointerGesture == EPointerGesture::ResizeReal && g_pointerDown &&
+             g_resize.id == info.id) || // the resized window: a retake every
+                                        // frame, the quad must track the box
+            info.id == FOCUSED_ID);
 
         // The frame after a resize gesture ended: one forced snapshot, whose
         // only purpose is the settled full-resolution silhouette refresh.
+        // Sets the loop-scoped flag -- an inner shadow here would leave
+        // g_skirtFinalRefreshId set forever (a forced retake every pass).
         bool finalSkirt = false;
         if (info.id == g_skirtFinalRefreshId) {
             finalSkirt = true;
             consumedSkirt = true;
         }
 
+        // Morph retake budget: a window already holding a snapshot waits for
+        // its rotation slot; fresh captures and layers are always served.
+        if (MORPHING && !FORCE && !finalSkirt && !info.isLayer &&
+            g_capture.has(info.id)) {
+            const size_t SLOT =
+                (index + morphCaptureCursor) % infos.size();
+
+            if (SLOT >= MORPH_RETAKE_BUDGET) {
+                ++index;
+                continue;
+            }
+        }
+
         if (info.isLayer)
             g_capture.makeSnapshotLayer(info.layer, mon, FORCE || finalSkirt);
+        else if (info.popup.lock())
+            g_capture.makeSnapshotPopup(info.popup, info.monitorLocalBox, mon, FORCE);
         else
             g_capture.makeSnapshot(info.window, mon, FORCE || finalSkirt);
+
+        ++index;
     }
+
+    morphCaptureCursor =
+        (morphCaptureCursor + 1) % std::max(infos.size(), size_t{1});
 
     if (consumedSkirt)
         g_skirtFinalRefreshId = 0;
@@ -1323,27 +1616,53 @@ static void serviceCapture() {
 
     g_capturing = true;
 
-    ghostWindows(MON);
-    refreshCaptures(Compat::enumerateEligibleWindows(MON), MON);
+    const auto INFOS = Compat::enumerateEligibleWindows(MON, g_cfgUnderLayers);
+
+    if (g_viewMorphArmed) {
+        // First pass of a fresh 3D session: capture the windows BEFORE the
+        // ghosting touches them. The morph's takeoff frame must show the
+        // 2D content sitting at the 2D rectangles -- then the ghosting
+        // force-floats the windows and the real boxes follow the morph.
+        refreshCaptures(INFOS, MON);
+        ghostWindows(MON, &INFOS);
+        buildEnterMorph(MON, INFOS);
+        g_viewMorphArmed = false;
+    } else {
+        ghostWindows(MON, &INFOS);
+        refreshCaptures(INFOS, MON);
+    }
 
     g_capturing = false;
 }
+
+// Attached surfaces (popups, X11 menus) -> their parent window's id, as of
+// the last syncWorld. Focus never goes to an attached surface itself: a menu
+// is used while its parent keeps the keyboard, and focusing anything else
+// (or nothing) dismisses it.
+static std::unordered_map<std::uintptr_t, std::uintptr_t> g_attachParent;
+
+static std::uintptr_t focusIdFor(std::uintptr_t id) {
+    const auto IT = g_attachParent.find(id);
+    return IT == g_attachParent.end() ? id : IT->second;
+}
+static World3D::SHit aimHit();
 
 // Handoff the keyboard to whatever the crosshair is on -- and to nothing else.
 // Aiming at empty space drops focus entirely rather than leaving the last
 // window typed into.
 static void updateAimFocus(float dt) {
-    if (g_pointerDown || g_clientButtonDown)
+    // Typing mode: the virtual cursor owns focus (focus follows it).
+    if (g_pointerDown || g_clientButtonDown || pointerFree() ||
+        Compat::layerHasKeyboardFocus())
         return;
 
     const auto& cam = g_scene.camera();
 
-    const World3D::SHit HIT =
-        g_world.pick(cam.position, cam.centerRay());
+    const World3D::SHit HIT = aimHit();
 
     // A scene model in front of the aimed window occludes it: no window
     // focus through geometry (one distance space for both classes).
-    std::uintptr_t AIMED = HIT.hit ? HIT.id : 0;
+    std::uintptr_t AIMED = HIT.hit ? focusIdFor(HIT.id) : 0;
     if (AIMED != 0 && modelInFront(cam.position, cam.centerRay(), HIT))
         AIMED = 0;
     g_lastAimedId = AIMED;
@@ -1392,7 +1711,34 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
     // monitor blur FBs; the compositor's outer endRender() then aborted in
     // CMonitor::useFP16(). Capture and ghosting therefore happen outside the
     // frame -- see serviceCapture().
-    const auto INFOS = Compat::enumerateEligibleWindows(mon);
+    auto INFOS = Compat::enumerateEligibleWindows(mon, g_cfgUnderLayers);
+
+    // Attached surfaces (popups, X11 menus) come after every window, so each
+    // finds its parent's entity already built this frame. An X11 menu whose
+    // X server named no parent belongs to the window that had focus when it
+    // appeared -- remembered, so it does not wander as focus moves.
+    {
+        static std::unordered_map<std::uintptr_t, std::uintptr_t> s_menuParent;
+        std::unordered_map<std::uintptr_t, std::uintptr_t> seen;
+        for (auto& I : INFOS) {
+            if (!I.attached || I.parentId != 0)
+                continue;
+            auto IT = s_menuParent.find(I.id);
+            const std::uintptr_t P =
+                IT != s_menuParent.end() ? IT->second : g_lastFocusId;
+            I.parentId = P;
+            seen[I.id] = P;
+        }
+        s_menuParent = std::move(seen);
+
+        std::stable_partition(INFOS.begin(), INFOS.end(),
+                              [](const auto& I) { return !I.attached; });
+
+        g_attachParent.clear();
+        for (const auto& I : INFOS)
+            if (I.attached && I.parentId)
+                g_attachParent[I.id] = I.parentId;
+    }
 
     g_winOutlines.clear();
 
@@ -1409,12 +1755,22 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // g_fsStableBoxes. Skipped while the exit re-assert is running: a
         // late Hyprland-side restore could pollute the memory with the
         // monitor-sized box, and the NEXT fullscreen cycle would then
-        // restore the giant size (the intermittent bug).
+        // restore the giant size (the intermittent bug). Also skipped while
+        // the view morph drives the boxes. The monitor-size check covers the
+        // frame between the fullscreen event and the first pump tick:
+        // Hyprland has already stretched the box, but g_fsCurrentId is not
+        // set yet -- and a room window is never monitor-sized, so such a box
+        // is always a fullscreen frame, never memory.
         if (!info.isLayer && info.window &&
             g_fsPhase == EFullscreenPhase::None && g_fsAssertFrames == 0 &&
-            info.id != g_fsCurrentId) // a fullscreened window's box is the
-                                      // monitor -- transient, never "stable"
-            g_fsStableBoxes[info.id] = Compat::currentWindowBox(info.window);
+            g_viewMorph == EViewMorph::None &&
+            info.id != g_fsCurrentId) { // a fullscreened window's box is the
+                                        // monitor -- transient, never "stable"
+            const CBox CUR = Compat::currentWindowBox(info.window);
+
+            if (std::fabs(CUR.w - MONW) > 0.5 || std::fabs(CUR.h - MONH) > 0.5)
+                g_fsStableBoxes[info.id] = CUR;
+        }
 
         // Not captured yet means not on screen, and something that is not on
         // screen must not be aimable -- otherwise focus could land on an
@@ -1428,11 +1784,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             continue;
 
         // Everything below uses the geometry captured WITH the snapshot, not
-        // the live box: updateRealResize writes the real window after
-        // render.pre, so the live box can be a frame ahead of the captured
-        // pixels. Quad, UV subrect and picking all follow the snapshot box,
-        // which keeps the drawn content and the crosshair mapping aligned
-        // during resizes -- otherwise the edges smear across the frame delta.
+        // the live box: the client's commit can land after render.pre, so
+        // the live box can be a frame ahead of the captured pixels. Quad,
+        // UV subrect and picking all follow the snapshot box, which keeps
+        // the drawn content and the crosshair mapping aligned -- otherwise
+        // the edges smear across the frame delta.
         const CBox& BOX = SNAPSHOT->sampledBox;
 
         World3D::SEntity entity;
@@ -1488,19 +1844,108 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         entity.spawnScale = WIN_SCALE;
 
         // Seed pose: existing entities own their world position and rotation.
+        // Next come the poses remembered from the last 3D session -- positions
+        // are per-mode, so the room comes back exactly as it was left. NEW
+        // windows (never dragged, no memory) spawn straight in front of the
+        // camera at a fixed read distance, facing it.
         // NEW windows spawn straight in front of the camera at a fixed read
         // distance, facing it.
-        if (const auto* EXISTING = g_world.find(info.id)) {
+        if (info.attached) {
+            // Popups and X11 menus sit on their parent window's plane at
+            // their real offset from it (so a menu opens where it was
+            // clicked), a hair in front of its face, and follow it.
+            const World3D::SEntity* PARENT = nullptr;
+            for (const auto& E : ENTITIES)
+                if (E.id == info.parentId)
+                    PARENT = &E;
+            const Compat::SWindowInfo* PINFO = nullptr;
+            for (const auto& I : INFOS)
+                if (I.id == info.parentId)
+                    PINFO = &I;
+            // Drawn once the parent is in the room (its axes come from it).
+            if (!PARENT || !PINFO || !g_world.find(info.parentId) ||
+                PARENT->logicalWidth <= 0 || PARENT->logicalHeight <= 0)
+                continue;
+
+            const double OX = info.monitorLocalBox.x - PINFO->monitorLocalBox.x;
+            const double OY = info.monitorLocalBox.y - PINFO->monitorLocalBox.y;
+            const float  CX = static_cast<float>(OX + info.monitorLocalBox.w * 0.5);
+            const float  CY = static_cast<float>(OY + info.monitorLocalBox.h * 0.5);
+
+            const float X = (CX / PARENT->logicalWidth - 0.5f) * PARENT->width;
+            const float Y = (0.5f - CY / PARENT->logicalHeight) * PARENT->height;
+            entity.center = PARENT->center + g_world.rightOf(PARENT->id) * X +
+                g_world.upOf(PARENT->id) * Y +
+                g_world.normalOf(PARENT->id) * (g_cfgWindowDepth * 0.5f + 0.01f);
+            entity.yaw        = PARENT->yaw;
+            entity.pitch      = PARENT->pitch;
+            entity.roll       = PARENT->roll;
+            entity.spawnScale = PARENT->spawnScale;
+
+            // A popup's hits are delivered to its parent window in the
+            // parent's surface space (the delivery finds the popup there).
+            if (info.popup.lock()) {
+                const float SX = static_cast<float>(OX - PINFO->surfaceOffset.x);
+                const float SY = static_cast<float>(OY - PINFO->surfaceOffset.y);
+                entity.surfaceOffsetX = -SX;
+                entity.surfaceOffsetY = -SY;
+                entity.surfaceWidth   = SX + static_cast<float>(info.monitorLocalBox.w);
+                entity.surfaceHeight  = SY + static_cast<float>(info.monitorLocalBox.h);
+            }
+        }
+        else if (const auto* EXISTING = g_world.find(info.id)) {
             entity.center = EXISTING->center;
             entity.yaw = EXISTING->yaw;
             entity.pitch = EXISTING->pitch;
             entity.roll = EXISTING->roll;
         }
+        else if (const auto POSE = g_savedPoses.find(info.id);
+                 POSE != g_savedPoses.end()) {
+            entity.center = POSE->second.center;
+            entity.yaw    = POSE->second.yaw;
+            entity.pitch  = POSE->second.pitch;
+            entity.roll   = POSE->second.roll;
+        }
+        else if (info.window && info.window->parent() &&
+                 !g_world.find(Compat::windowId(info.window->parent())) &&
+                 std::any_of(INFOS.begin(), INFOS.end(), [&](const auto& I) {
+                     return I.id == Compat::windowId(info.window->parent());
+                 })) {
+            // Its parent is new to the room too (both mapped this frame):
+            // wait a frame for the parent's pose instead of spawning at the
+            // same spot and fighting it for depth.
+            continue;
+        }
+        else if (const auto* DIALOG_PARENT =
+                     info.window && info.window->parent()
+                         ? g_world.find(Compat::windowId(info.window->parent()))
+                         : nullptr) {
+            // A dialog (file chooser, preferences) opens just in front of the
+            // window that asked for it, facing the same way.
+            entity.center = DIALOG_PARENT->center +
+                g_world.normalOf(DIALOG_PARENT->id) * 0.3f;
+            entity.yaw   = DIALOG_PARENT->yaw;
+            entity.pitch = DIALOG_PARENT->pitch;
+            entity.roll  = DIALOG_PARENT->roll;
+        }
         else {
             const auto& CAM = g_scene.camera();
             const Vec3 FWD = CAM.forward();
 
-            entity.center = CAM.position + FWD * g_cfgSpawnDistance;
+            // Never on the far side of a wall: a spawn point behind scene
+            // geometry comes forward to just in front of it. Nor inside a
+            // window already there: windows opened one after another without
+            // moving would share the spot and fight for depth, so the new
+            // one stands just in front of whatever window is in the way.
+            float dist = g_cfgSpawnDistance;
+            if (const auto WALL = modelRayHit(CAM.position, FWD, false);
+                WALL.hit && WALL.dist < dist + 0.3f)
+                dist = std::max(0.6f, WALL.dist - 0.3f);
+            if (const auto WIN = g_world.pick(CAM.position, FWD);
+                WIN.hit && WIN.distance < dist + 0.15f)
+                dist = std::max(0.5f, WIN.distance - 0.15f);
+
+            entity.center = CAM.position + FWD * dist;
 
             // Face the camera: with this model's convention (the normal's Y
             // component is -sin(pitch)) the target is the camera's own yaw
@@ -1509,10 +1954,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.pitch = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
         }
 
-        // The quad size ALWAYS follows the snapshot box (times the spawn
-        // scale): the UV subrect and the input mapping are box-relative, so a
-        // stale world size would squish the content and shrink the input zone
-        // on every resize.
+        // The quad size follows the snapshot box (times the config scale):
+        // the real box IS the room's content resolution -- a 3D resize is a
+        // real resize (the client re-renders, crisp at any size), and the
+        // per-mode size memory lives in the box animation of the view morph
+        // (enter drives the real box to the remembered room box, exit back
+        // to the 2D box).
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
 
@@ -1643,7 +2090,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
 
     // Aim focus updates freeze during the fullscreen transition: the flying
     // quad sweeps the crosshair across other windows and would thrash focus.
-    if (g_fsPhase == EFullscreenPhase::None)
+    // The view morph flies every window at once -- same freeze.
+    if (g_fsPhase == EFullscreenPhase::None && g_viewMorph == EViewMorph::None)
         updateAimFocus(dt);
 }
 
@@ -1664,24 +2112,33 @@ static Vector2D localFromHit(const World3D::SHit& hit) {
     const float Y = std::clamp(hit.v, 0.0f, 1.0f) * ENTITY->logicalHeight -
         ENTITY->surfaceOffsetY;
 
+    // surfaceWidth/Height can go negative for degenerate boxes (a window
+    // mid-map with a border offset larger than the box); a hardened
+    // std::clamp aborts on lo > hi, so the bounds are floored at zero.
     return {
-        std::clamp(X, 0.0f, ENTITY->surfaceWidth),
-        std::clamp(Y, 0.0f, ENTITY->surfaceHeight),
+        std::clamp(X, 0.0f, std::max(0.0f, ENTITY->surfaceWidth)),
+        std::clamp(Y, 0.0f, std::max(0.0f, ENTITY->surfaceHeight)),
     };
 }
 
-static World3D::SHit aimHit() {
+// Nearest hit along a camera ray whose pixels are actually visible. A window
+// that was never captured is drawn as nothing (the renderer skips it too), so
+// it must not catch the aim, focus or a click either -- an off-screen window
+// would otherwise sit invisibly in front of the view. An invisible layer
+// overlay (transparent quickshell PanelWindow) must not swallow the ray
+// either: empty pixels fall through to the surface underneath. This is also
+// what keeps aim/focus from flapping between an overlay and the window it
+// covers.
+static World3D::SHit pickVisible(const Vec3& dir) {
     const auto& cam = g_scene.camera();
 
-    // Nearest hit whose pixels are actually visible: an invisible layer
-    // overlay (transparent quickshell PanelWindow) must not swallow the
-    // crosshair -- empty pixels fall through to the surface underneath. This
-    // is also what keeps aim/focus from flapping between an overlay and the
-    // window it covers.
-    for (const auto& HIT : g_world.pickAll(cam.position, cam.centerRay())) {
+    for (const auto& HIT : g_world.pickAll(cam.position, dir)) {
         const auto* SNAPSHOT = g_capture.get(HIT.id);
 
-        if (SNAPSHOT && SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {
+        if (!SNAPSHOT || (!SNAPSHOT->bigTex && !SNAPSHOT->texID))
+            continue;
+
+        if (SNAPSHOT->alphaValid && !SNAPSHOT->alphaMask.empty()) {
             const int MX = std::min(SNAPSHOT->alphaW - 1,
                 static_cast<int>(HIT.u * SNAPSHOT->alphaW));
             const int MY = std::min(SNAPSHOT->alphaH - 1,
@@ -1697,6 +2154,10 @@ static World3D::SHit aimHit() {
     }
 
     return {};
+}
+
+static World3D::SHit aimHit() {
+    return pickVisible(g_scene.camera().centerRay());
 }
 
 // Resolves a hit id into either a window or a layer surface.
@@ -1716,7 +2177,27 @@ static SHitTarget targetFromHit(std::uintptr_t id) {
     if (!target.layer)
         target.window = Compat::findWindowById(id);
 
+    // A popup's input goes to its parent window in the parent's surface
+    // space (the entity maps hits there); the delivery finds the popup under
+    // the point.
+    if (!target.layer && !target.window)
+        target.window = Compat::findPopupParentById(id);
+
     return target;
+}
+
+// Focus for a window hit in the room: an X11 menu (attached) hands it to its
+// parent instead.
+static void focusRoomWindow(const PHLWINDOW& window) {
+    if (!window)
+        return;
+    const auto ID = Compat::windowId(window);
+    if (const auto PARENT_ID = focusIdFor(ID); PARENT_ID != ID) {
+        if (const auto PARENT = Compat::findWindowById(PARENT_ID))
+            Compat::focusWindow(PARENT);
+        return;
+    }
+    Compat::focusWindow(window);
 }
 
 static bool rayPlanePoint(
@@ -1798,8 +2279,10 @@ static CBox resizeBoxFromAim(const Vec3& point, const PHLMONITOR& mon) {
     const auto MIN = g_resize.window->minSize().value_or(Vector2D{1.0, 1.0});
     const auto MAX = g_resize.window->maxSize().value_or(Vector2D{INFINITY, INFINITY});
 
-    out.w = std::clamp(out.w, MIN.x, MAX.x);
-    out.h = std::clamp(out.h, MIN.y, MAX.y);
+    // A client may report min > max; a hardened std::clamp aborts on an
+    // inverted range, so the bounds are sorted first.
+    out.w = std::clamp(out.w, std::min(MIN.x, MAX.x), std::max(MIN.x, MAX.x));
+    out.h = std::clamp(out.h, std::min(MIN.y, MAX.y), std::max(MIN.y, MAX.y));
 
     if (g_resize.edgeX > 0)
         out.x = start.x;
@@ -1839,19 +2322,29 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
 
     g_fsWindow = window;
 
-    // The floating box: the POSITION from the stable memory (where the
-    // window lived), the SIZE from Hyprland's own remembered floating size.
-    // When the FS was engaged, Hyprland remembered the pre-fullscreen size
-    // there (setTargetFullscreenModeInternal does it BEFORE stretching the
-    // window to the monitor) -- exactly the size the 2D FS-exit restores.
-    // The stable memory is the fallback (e.g. a tiled window has no
-    // floating history: its tile size is the honest original).
+    // A pre-existing window fullscreened while the room is open: the
+    // passthrough and its restore drive the REAL box and force-float the
+    // window. The exit morph animates the box back to the saved 2D box, and
+    // the exit's restore flips the flag back.
+    if (g_sessionWindows.count(Compat::windowId(window))) {
+        g_boxDriven.insert(Compat::windowId(window));
+        g_flagFloated.insert(Compat::windowId(window));
+    }
+
+    // The floating box: the stable memory is the honest pre-fullscreen box
+    // (the room drove it there, and the tracking above skips fullscreen
+    // frames). Hyprland's remembered floating size is the FALLBACK, for a
+    // window never seen at rest: the live box is already the monitor by
+    // then, and setTargetFullscreenModeInternal remembered the pre-FS size
+    // before stretching. Preferring the memory unconditionally pulled stale
+    // sizes from old floating cycles into the restore (tiled windows carry
+    // garbage there) -- the 3D size reset after a fullscreen round-trip.
     if (captureRestoreBox) {
-        const auto IT = g_fsStableBoxes.find(ID);
-        CBox RESTORE = IT != g_fsStableBoxes.end() ?
+        const auto IT   = g_fsStableBoxes.find(ID);
+        CBox       RESTORE = IT != g_fsStableBoxes.end() ?
             IT->second : Compat::currentWindowBox(window);
 
-        if (window->m_target) {
+        if (IT == g_fsStableBoxes.end() && window->m_target) {
             const auto LF = window->m_target->lastFloatingSize();
 
             if (LF.x > 5.0 && LF.y > 5.0)
@@ -1929,7 +2422,7 @@ static void startTo3D() {
             g_fsRollAtStart = wrapPi(E->roll);
         }
 
-        if (Compat::setCursorHidden(true))
+        if (!pointerFree() && Compat::setCursorHidden(true))
             Pointer::mgr()->resetCursorImage();
 
         Compat::setPointerCapture(g_hookInstalled);
@@ -2008,30 +2501,22 @@ static void pollFullscreen() {
     }
 
     if (g_fsPhase == EFullscreenPhase::None) {
-        if (FSW && !g_fsWasOn && ownsInput())
-            startTo2D(FSW);
-        else {
-            g_fsWasOn = FSW != nullptr;
+        if (FSW && !g_fsWasOn) {
+            // The FS may engage while the room is still transitioning
+            // (ownsInput() false): leave g_fsWasOn false and start the
+            // passthrough on the first tick the room owns input. Marking it
+            // handled here instead would leave the window monitor-sized in
+            // the room forever -- the passthrough never running at all.
+            if (ownsInput())
+                startTo2D(FSW); // sets g_fsWasOn itself
+        } else if (!FSW) {
+            g_fsWasOn = false;
 
-            // A fullscreen EXITED while the room is plain 3D (no transition
-            // was running -- e.g. the FS predated the 3D entry): make the
-            // window a spawn-sized floating panel AND hold it with the same
-            // condition-driven assert the To3D completion uses -- Hyprland's
-            // floating layout re-applies ITS remembered size (possibly
-            // monitor-sized from an old cycle), and a one-shot set loses to
-            // it.
-            if (!FSW && g_fsWasOn) {
-                if (auto OLDW = g_fsLastFSWindow.lock()) {
-                    const auto CUR = Compat::currentWindowBox(OLDW);
-
-                    g_fsAssertBox    = CBox{CUR.x, CUR.y, kSpawnWidth,
-                                            kSpawnHeight};
-                    g_fsAssertFrames = 1;
-                    g_fsStableCount  = 0;
-
-                    Compat::setWindowBox(OLDW, g_fsAssertBox);
-                }
-            }
+            // A fullscreen EXITED while the room is plain 3D and no
+            // passthrough ever ran for it (it engaged mid-transition):
+            // Hyprland's own FS exit restored the pre-FS box and size --
+            // nothing to drive here. The spawn-size assert this branch used
+            // to run fought the layout for nothing.
         }
 
         g_fsLastFSWindow = FSW;
@@ -2123,8 +2608,14 @@ static void applyFullscreenAnimation() {
         B0.h + (B1.h - B0.h) * p,
     };
 
+    // driveWindowBox, not setWindowBox: the float flip inside setWindowBox
+    // sent a fullscreened TILED window through Hyprland's
+    // changeFloatingMode -- un-FS, floating layout reposition, re-FS -- which
+    // flickered the first fullscreen attempt, wrecked the tile and left the
+    // stale remembered floating size in charge of the restore (the 3D size
+    // reset). The room drives the box either way; the tree stays untouched.
     if (auto W = g_fsWindow.lock())
-        Compat::setWindowBox(W, BOX);
+        Compat::driveWindowBox(W, BOX);
 
     // The quad follows the animated box at the room's pixel density. The
     // fullscreen quad maps 1:1 onto the monitor by definition, so the room's
@@ -2190,7 +2681,7 @@ static void applyFullscreenAnimation() {
                     // The original position AND the pre-fullscreen size:
                     // Hyprland remembered the size when the FS was engaged,
                     // the box lerp above already animated the real box there.
-                    Compat::setWindowBox(W2, g_fsRestoreBox);
+                    Compat::driveWindowBox(W2, g_fsRestoreBox);
 
                     // Hyprland's own fullscreen-exit restore animates the
                     // window toward ITS remembered floating size -- which our
@@ -2225,6 +2716,356 @@ static void applyFullscreenAnimation() {
                 g_fsPhase = EFullscreenPhase::None;
             }
         }
+    }
+}
+
+// --- 2D/3D view morph --------------------------------------------------------
+//
+// The toggle transition. Every window's 2D rectangle (monitor-local, logical
+// px) is back-projected onto the camera frustum plane -- the pose where the
+// quad covers its on-screen spot exactly, the fullscreen passthrough's
+// construction generalized to every window. Entering 3D, the quads take off
+// from those poses and fly to the room poses while the environment fades in
+// per-pixel; leaving 3D reverses it. The layout tree is never torn down
+// (pre-existing windows keep their membership), so a window whose room box
+// differs from its 2D box (a 3D resize) animates its REAL box between the
+// two -- the client re-renders mid-flight, the content never jumps scale,
+// and the exit lands on the exact saved 2D geometry.
+
+static CBox viewMorphLocalBox(const PHLMONITOR& mon, const CBox& global) {
+    return CBox{
+        global.x - mon->m_position.x,
+        global.y - mon->m_position.y,
+        global.w,
+        global.h,
+    };
+}
+
+static CBox lerpBox(const CBox& A, const CBox& B, float t) {
+    return CBox{
+        A.x + (B.x - A.x) * t,
+        A.y + (B.y - A.y) * t,
+        A.w + (B.w - A.w) * t,
+        A.h + (B.h - A.h) * t,
+    };
+}
+
+static float smoothstep01(float x) {
+    x = std::clamp(x, 0.0f, 1.0f);
+    return x * x * (3.0f - 2.0f * x);
+}
+
+static bool boxesDiffer(const CBox& A, const CBox& B) {
+    return std::fabs(A.x - B.x) > 0.5 || std::fabs(A.y - B.y) > 0.5 ||
+        std::fabs(A.w - B.w) > 0.5 || std::fabs(A.h - B.h) > 0.5;
+}
+
+// Entered 3D: the morph table -- room poses (and remembered world sizes)
+// from the memory, or the fresh spawn in front of the camera. The takeoff
+// rectangle is always the live box: the layout owns the real geometry in
+// both modes.
+static void buildEnterMorph(
+    const PHLMONITOR& /*mon*/, const std::vector<Compat::SWindowInfo>& infos) {
+    g_viewMorphWins.clear();
+
+    const auto& CAM = g_scene.camera();
+    const Vec3  FWD = CAM.forward();
+
+    int i = 0;
+
+    for (const auto& info : infos) {
+        SViewMorphWin MW;
+
+        const auto* SNAPSHOT = g_capture.get(info.id);
+
+        MW.box2D = SNAPSHOT ? SNAPSHOT->sampledBox : info.monitorLocalBox;
+        MW.boxRoom = MW.box2D;
+
+        if (const auto POSE = g_savedPoses.find(info.id);
+            POSE != g_savedPoses.end()) {
+            MW.roomPose = POSE->second;
+
+            // Sizes are per-mode: the room keeps the real box the window
+            // had here last time. The morph drives the real box there (the
+            // client re-renders -- crisp content at the room's size); the
+            // layout tree underneath is untouched.
+            if (MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0)
+                MW.boxRoom = MW.roomPose.box;
+        } else {
+            // The same fresh spawn syncWorld seeds for unknown windows.
+            MW.roomPose.center = CAM.position + FWD * g_cfgSpawnDistance;
+            MW.roomPose.yaw    = std::atan2(-FWD.x, -FWD.z);
+            MW.roomPose.pitch  = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
+            MW.roomPose.roll   = 0.0f;
+        }
+
+        MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
+
+        // Every window's box is frozen at enter: the room is its own
+        // universe. Driven windows are additionally enforced against
+        // floating machinery; ALL tiled windows are enforced against tree
+        // reflows -- a spawn or a float toggle must not re-tile the room.
+        g_roomBoxes[info.id] = MW.boxRoom;
+
+        if (MW.animBox)
+            g_boxDriven.insert(info.id); // the exit morph undoes this drive
+
+        MW.stack = static_cast<float>(i) * kMorphStackEps;
+        ++i;
+
+        g_viewMorphWins[info.id] = MW;
+    }
+
+    g_viewMorph = EViewMorph::To3D;
+}
+
+// Leaving 3D: freeze the room poses into the saved memory (a mid-flight
+// enter morph contributes its intended room pose, not the flight), then
+// aim every quad at the rectangle the 2D desktop is about to show: the live
+// floating box for floating windows, the saved tile box for tiled ones.
+static void beginExit3D() {
+    if (!g_active)
+        return;
+
+    resetPointerGesture();
+
+    // No morph through fullscreen passthrough phases: the legacy fade runs.
+    const auto MON = targetMonitor();
+
+    if (g_fsPhase != EFullscreenPhase::None || !MON)
+        return;
+
+    // An interrupted ENTER morph contributes its intended room poses.
+    const auto PREVIOUS = std::move(g_viewMorphWins);
+
+    if (!g_world.entities().empty())
+        g_savedPoses.clear(); // rebuilt from the live room below; an empty
+                              // room (toggled off before the first frame)
+                              // keeps the previous session's memory
+    g_viewMorphWins.clear();
+
+    int i = 0;
+
+    for (const auto& ENTITY : g_world.entities()) {
+        SViewMorphWin MW;
+
+        // The intended room pose: mid-flight exits keep the destination.
+        bool midEnter = false;
+
+        if (auto POSE = PREVIOUS.find(ENTITY.id); POSE != PREVIOUS.end()) {
+            MW.roomPose = POSE->second.roomPose;
+            midEnter    = true;
+        } else {
+            MW.roomPose = SViewPose{
+                ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
+        }
+
+        // The room's real box rides the memory -- the next entry drives the
+        // real box back to it (sizes are per-mode). A mid-ENTER exit keeps
+        // the INTENDED box: the live box of a driven window is a flight
+        // frame (a lerp between the 2D and the room box), and saving it
+        // would replace the remembered 3D size with that in-between size --
+        // the rapid-toggle size reset. It also keeps the exit drive
+        // continuous with the enter drive (both lerp between the same two
+        // boxes).
+        const auto* SNAPSHOT = g_capture.get(ENTITY.id);
+
+        MW.boxRoom = SNAPSHOT ?
+            SNAPSHOT->sampledBox :
+            CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
+                 ENTITY.logicalWidth, ENTITY.logicalHeight};
+
+        if (midEnter && MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0)
+            MW.boxRoom = MW.roomPose.box;
+
+        // A window left fullscreen without the passthrough (the FS engaged
+        // while the room was still transitioning): its live box is the
+        // monitor -- never a room size. The room box memory holds the
+        // honest size.
+        if (ENTITY.id == g_fsCurrentId) {
+            const auto ROOM = g_roomBoxes.find(ENTITY.id);
+
+            if (ROOM != g_roomBoxes.end())
+                MW.boxRoom = ROOM->second;
+            else if (MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0)
+                MW.boxRoom = MW.roomPose.box;
+        }
+
+        MW.roomPose.box = MW.boxRoom;
+
+        g_savedPoses[ENTITY.id] = MW.roomPose;
+
+        // The 2D box the window must land on: the layout save. The
+        // room-box enforcer refreshes it live whenever the tree re-asserts
+        // (a reflow), so it is always the CURRENT 2D truth -- a reflowed
+        // window lands exactly where the settle recalc will keep it, no
+        // post-landing jump. Ghosted windows (session newcomers, the
+        // pre-fullscreen panel) are owned by their full restore path.
+        MW.box2D   = MW.boxRoom;
+        MW.animBox = false;
+
+        for (const auto& SAVE : g_layoutSaves) {
+            if (SAVE.id != ENTITY.id || SAVE.ghosted)
+                continue;
+
+            MW.box2D   = viewMorphLocalBox(MON, SAVE.box);
+            MW.animBox = boxesDiffer(MW.box2D, MW.boxRoom);
+
+            break;
+        }
+
+        MW.stack = static_cast<float>(i) * kMorphStackEps;
+        ++i;
+
+        g_viewMorphWins[ENTITY.id] = MW;
+    }
+
+    g_viewMorph = EViewMorph::To2D;
+}
+
+// One morph frame: quad pose = lerp(screen pose of the current snapshot box,
+// room pose, s); size lerp(1:1, config scale, s); the real box follows the
+// same s for animBox windows (a 3D resize's box memory). Written into BOTH
+// the render entry (zero lag) and the entity (picking + next frame's reseed
+// agree with the render).
+static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
+    if (!mon)
+        return;
+
+    const auto& CAM = g_scene.camera();
+
+    for (auto& RW : g_renderWindows) {
+        const auto MWIT = g_viewMorphWins.find(RW.id);
+
+        if (MWIT == g_viewMorphWins.end())
+            continue;
+
+        const SViewMorphWin& MW = MWIT->second;
+
+        World3D::SEntity* E = g_world.find(RW.id);
+
+        if (!E)
+            continue;
+
+        // The box whose content the snapshot shows NOW. The real box driven
+        // below reaches the snapshot one capture later -- the same one-frame
+        // lag the fullscreen transition lives with.
+        const auto* SNAPSHOT = g_capture.get(RW.id);
+        CBox BOX = SNAPSHOT ? SNAPSHOT->sampledBox : MW.boxRoom;
+
+        if (MW.animBox) {
+            if (auto W = Compat::findWindowById(RW.id)) {
+                const CBox TARGET = lerpBox(MW.box2D, MW.boxRoom, s);
+
+                Compat::driveWindowBox(
+                    W,
+                    CBox{TARGET.x + mon->m_position.x,
+                         TARGET.y + mon->m_position.y, TARGET.w, TARGET.h});
+
+                // The quad follows the MORPH's own box path, not the
+                // snapshot's: the capture budget refreshes snapshots in
+                // rotation, and a snapshot-driven quad would step every few
+                // frames -- the jerky transition. The UV still maps the
+                // snapshot's region, so the content runs a few frames
+                // behind the box mid-flight; at flight speed that reads as
+                // a smooth stretch, and the first ungated pass after the
+                // morph lands the exact sizes.
+                BOX = TARGET;
+
+                g_boxDriven.insert(RW.id);
+            }
+        }
+
+        // Exact 1:1 on the frustum plane at s=0, the room scale at s=1.
+        const float SCALE = 1.0f + (configWindowScale() - 1.0f) * s;
+
+        const auto SP = ScreenProject::project(
+            CAM.position, CAM.yaw, CAM.pitch, CAM.mirrorView, g_scene.zoom(),
+            kFovDeg * (3.14159265f / 180.0f), mon->m_size.x, mon->m_size.y,
+            BOX.x + BOX.w * 0.5f, BOX.y + BOX.h * 0.5f, MW.stack);
+
+        const Vec3 C = SP.center + (MW.roomPose.center - SP.center) * s;
+
+        RW.x = C.x;
+        RW.y = C.y;
+        RW.z = C.z;
+        RW.yaw   = SP.yaw + wrapPi(MW.roomPose.yaw - SP.yaw) * s;
+        RW.pitch = SP.pitch + (MW.roomPose.pitch - SP.pitch) * s;
+        RW.roll  = MW.roomPose.roll * s;
+
+        RW.width  = ScreenProject::widthWorld(BOX.w) * SCALE;
+        RW.height = ScreenProject::heightWorld(BOX.h) * SCALE;
+
+        E->center = C;
+        E->yaw    = RW.yaw;
+        E->pitch  = RW.pitch;
+        E->roll   = RW.roll;
+        E->width  = RW.width;
+        E->height = RW.height;
+    }
+}
+
+static void applyViewMorph(const PHLMONITOR& mon) {
+    if (g_viewMorph == EViewMorph::None) {
+        g_morphS = 1.0f;
+        g_scene.setEnvAlpha(1.0f);
+        return;
+    }
+
+    if (g_fsPhase != EFullscreenPhase::None) {
+        // The passthrough owns the screen the moment it starts: land the
+        // morph instantly at its endpoint and step aside.
+        const float S_END = g_viewMorph == EViewMorph::To3D ? 1.0f : 0.0f;
+
+        g_morphS = S_END;
+        g_scene.setEnvAlpha(S_END);
+        applyViewMorphWindows(mon, S_END);
+
+        g_viewMorph = EViewMorph::None;
+        g_viewMorphWins.clear();
+        return;
+    }
+
+    const float RAW = std::clamp(g_transition, 0.0f, 1.0f);
+
+    g_morphS = RAW * RAW * (3.0f - 2.0f * RAW);
+
+    // The room's environment materializes (or dissolves) twice as fast as
+    // the windows fly, both ways -- symmetric. On the way IN that hides the
+    // desktop while Hyprland is still fade-hiding the freshly ghosted 2D
+    // windows (an exposed desktop mid-flight would show them stacked under
+    // the flying quads; the alpha channels cannot be forced quiet instead --
+    // they bake into the snapshots). On the way OUT it mirrors the entrance.
+    g_scene.setEnvAlpha(smoothstep01(std::min(1.0f, RAW * 2.0f)));
+
+    applyViewMorphWindows(mon, g_morphS);
+
+    // The enter morph ends with the transition; the exit morph ends when
+    // the transition drains to zero (deactivate3D resets the state).
+    if (g_transitionTarget > 0.5f && g_transition >= 1.0f) {
+        g_viewMorph = EViewMorph::None;
+        g_viewMorphWins.clear();
+    }
+}
+
+// Remember the room as it is right now; prunes windows that no longer exist.
+static void saveViewPoses() {
+    g_savedPoses.clear();
+
+    for (const auto& E : g_world.entities()) {
+        SViewPose POSE{E.center, E.yaw, E.pitch, E.roll,
+            CBox{E.logicalLeft, E.logicalTop, E.logicalWidth, E.logicalHeight}};
+
+        // A window left fullscreen (no passthrough ran for it): its live box
+        // is the monitor -- never a room size. Keep the remembered one.
+        if (E.id == g_fsCurrentId) {
+            const auto ROOM = g_roomBoxes.find(E.id);
+
+            if (ROOM != g_roomBoxes.end())
+                POSE.box = ROOM->second;
+        }
+
+        g_savedPoses[E.id] = POSE;
     }
 }
 
@@ -2356,7 +3197,21 @@ static void updateRealResize() {
         return;
 
     const CBox BOX = resizeBoxFromAim(point, MON);
-    Compat::setWindowBox(g_resize.window, BOX);
+
+    // A real resize: the client re-renders at the new size, so the content
+    // stays crisp at any room size. The 2D box is remembered at entry and
+    // the exit morph animates the real box back to it -- sizes stay
+    // per-mode without stretching the texture. The drive goes through
+    // driveWindowBox: no floating-flag flip, the layout tree node is
+    // untouched.
+    Compat::driveWindowBox(g_resize.window, BOX);
+    g_boxDriven.insert(g_resize.id);
+    g_roomBoxes[g_resize.id] =
+        CBox{BOX.x - MON->m_position.x, BOX.y - MON->m_position.y, BOX.w,
+             BOX.h};
+
+    ++g_diagResizeDrives;
+    g_diagLastResizeBox = BOX;
 }
 
 static void resetPointerGesture() {
@@ -2459,6 +3314,15 @@ static bool onPointerMotion(double dx, double dy) {
     if (!ownsInput())
         return false;
 
+    if (pointerFree()) {
+        if (g_vcSpace == ECursorSpace::Desktop)
+            return false; // the real cursor is out on the desktop
+
+        vcMove(dx, dy);
+        damageCurrentMonitor();
+        return true;
+    }
+
     g_input.addMotion(dx, dy);
     damageCurrentMonitor();
     return true;
@@ -2474,7 +3338,8 @@ static void onRenderPre(PHLMONITOR mon) {
         return;
     }
 
-    g_currentRenderMon = mon;
+    g_currentRenderMon   = mon;
+    g_roomDrawnThisFrame = false;
 
     if (!g_active) {
         g_monitor = mon;
@@ -2483,6 +3348,7 @@ static void onRenderPre(PHLMONITOR mon) {
 
     g_monitor = mon;
     serviceCapture();
+    refreshCursorImage();
 }
 
 
@@ -2495,15 +3361,38 @@ static void deactivate3D() {
     g_active = false;
     stopFramePump();
 
+    // Positions are per-mode: remember the room as it was for the next
+    // session -- unless the exit morph already saved the poses (the entity
+    // poses are at the screen endpoints by now). The camera pose rides the
+    // same memory: the next entry resumes the walk, look angles included.
+    if (g_viewMorph != EViewMorph::To2D)
+        saveViewPoses();
+
+    {
+        const auto& CAM = g_scene.camera();
+        g_savedCamPos   = CAM.position;
+        g_savedCamYaw   = CAM.yaw;
+        g_savedCamPitch = CAM.pitch;
+        g_savedViewMode = g_viewMode;
+        g_savedCamValid = true;
+    }
+
+    g_viewMorph       = EViewMorph::None;
+    g_viewMorphArmed  = false;
+    g_viewMorphWins.clear();
+    g_morphS = 1.0f;
+    g_boxDriven.clear();
+    g_roomBoxes.clear();
+    g_flagFloated.clear();
+    g_sessionWindows.clear();
+    g_capture.setSkirtDeferred(false);
+
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
-    // monitor-sized). The SIZE is the spawn size -- never the possibly
-    // polluted restore box.
+    // monitor-sized). The restore box is the honest pre-FS box now -- the
+    // drive keeps the window's floating state exactly as it was.
     if (auto W = g_fsWindow.lock())
-        Compat::setWindowBox(
-            W,
-            CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
-                 kSpawnHeight});
+        Compat::driveWindowBox(W, g_fsRestoreBox);
 
     g_fsPhase        = EFullscreenPhase::None;
     g_fsWindow       = {};
@@ -2561,6 +3450,41 @@ static void enter3D() {
     g_active = true;
     startFramePump();
 
+    // A rapid toggle off->on can skip the deferred teardown: its doLater
+    // finds the room already reopened and bails. Heal whatever that left --
+    // ghosted windows go back to the layout and the session bookkeeping
+    // resets -- or the new session inherits stale layout saves and drives
+    // windows to boxes from a previous session.
+    if (g_ghosted)
+        unghostWindows();
+
+    // An interrupted EXIT left the driven windows mid-lerp between the room
+    // and 2D boxes. Land them on their 2D targets now: the fresh session's
+    // first capture becomes the 2D layout memory, and a mid-flight box saved
+    // there would surface as a corrupted layout on the next exit.
+    if (g_viewMorph == EViewMorph::To2D) {
+        if (const auto MON = targetMonitor()) {
+            for (auto& [ID, MW] : g_viewMorphWins) {
+                if (!MW.animBox)
+                    continue;
+
+                if (auto W = Compat::findWindowById(ID))
+                    Compat::driveWindowBox(
+                        W,
+                        CBox{MW.box2D.x + MON->m_position.x,
+                             MW.box2D.y + MON->m_position.y, MW.box2D.w,
+                             MW.box2D.h});
+            }
+        }
+    }
+
+    g_layoutSaves.clear();
+    g_sessionWindows.clear();
+    g_boxDriven.clear();
+    g_roomBoxes.clear();
+    g_flagFloated.clear();
+    g_ghosted = false;
+
     // Hide the host cursor: the 3D view aims with its own crosshair. Client
     // cursor updates are gated by the hooks; the client re-applies its own
     // image automatically when pointer focus re-enters on exit.
@@ -2584,20 +3508,43 @@ static void enter3D() {
     g_world.clear();
     g_renderWindows.clear();
 
+    // The view morph arms here but builds on the first capture pass, AFTER
+    // the pre-ghost snapshots exist (see serviceCapture). Poses remembered
+    // by the previous session survive: positions are per-mode.
+    g_viewMorph       = EViewMorph::None;
+    g_viewMorphWins.clear();
+    g_viewMorphArmed  = true;
+    g_morphS          = 0.0f;
+    g_boxDriven.clear();
+
+    // The pre-ghost captures must not pay for silhouette traces: the boxes
+    // are about to be driven by the morph, and the analytic fallback
+    // outlines cover the flight. update3D keeps this in sync per frame.
+    g_capture.setSkirtDeferred(true);
+
     // Player spawn point (config player_spawn): the coordinates are the
     // player's FEET, so spawning at 0,0,0 stands on the grid platform at
     // world zero instead of falling through it. Eyes ride kEyeHeight above.
+    // A previous session restores its full camera pose instead: the walk
+    // continues where it left off, look angles included.
     {
         auto& CAM = g_scene.camera();
-        CAM.position = Vec3{
-            g_playerSpawn.x,
-            g_playerSpawn.y + Camera::kEyeHeight,
-            g_playerSpawn.z,
-        };
 
-        // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
-        // from (x, z) means yaw = atan2(-x, z).
-        CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+        if (g_savedCamValid) {
+            CAM.position = g_savedCamPos;
+            CAM.yaw      = g_savedCamYaw;
+            CAM.pitch    = g_savedCamPitch;
+        } else {
+            CAM.position = Vec3{
+                g_playerSpawn.x,
+                g_playerSpawn.y + Camera::kEyeHeight,
+                g_playerSpawn.z,
+            };
+
+            // Camera forward is {sin yaw, ., -cos yaw}: looking at the origin
+            // from (x, z) means yaw = atan2(-x, z).
+            CAM.yaw = std::atan2(-g_playerSpawn.x, g_playerSpawn.z);
+        }
     }
 
     g_capture.releaseAll();
@@ -2605,12 +3552,20 @@ static void enter3D() {
     resetMovementKeys();
 
     g_grounded = false;
-    g_viewMode = 0;
-    g_scene.camera().mirrorView = false;
-    g_scene.setPlayerVisible(false);
+    // The camera mode (F5: first person / third behind / third front) rides
+    // the same cross-session memory as the camera pose.
+    g_viewMode = g_savedCamValid ? g_savedViewMode : 0;
+    g_scene.camera().mirrorView = g_viewMode == 2;
+    g_scene.setPlayerVisible(g_viewMode != 0);
     g_scene.setPlayerDebugCapsule(Vec3{}, false);
 
     g_keyboardMode = EKeyboardMode::Space;
+    g_scene.setCrosshairVisible(true);
+    g_freeOnRoom     = false;
+    g_swallowRelease = 0;
+    g_vcSpace        = ECursorSpace::Desktop;
+    g_vcId           = 0;
+    g_scene.setPointer({});
     g_altHeld      = false;
     s_zoomId       = 0;
 
@@ -2618,19 +3573,41 @@ static void enter3D() {
     // standard spawn-sized floating panel (a fullscreened/tiled box would
     // otherwise enter the room monitor-sized AND pollute the stable-box
     // memory). The passthrough still triggers on the fullscreen EVENT.
-    if (const auto MON = targetMonitor()) {
-        if (const auto FSW =
-                Fullscreen::controller()->getFullscreenWindow(MON)) {
-            Compat::setWindowBox(
-                FSW,
-                CBox{MON->m_position.x + MON->m_size.x * 0.5 -
-                         kSpawnWidth * 0.5,
-                     MON->m_position.y + MON->m_size.y * 0.5 -
-                         kSpawnHeight * 0.5,
-                     kSpawnWidth, kSpawnHeight});
+    // This is the ONE pre-existing window that leaves the layout: it is
+    // force-floated and ghosted, so the saved tree is not disturbed by the
+    // shrink, and the exit restores it as a floating panel (the FS exit
+    // path asserts that size).
+        if (const auto MON = targetMonitor()) {
+            if (const auto FSW =
+                    Fullscreen::controller()->getFullscreenWindow(MON)) {
+                const double PX =
+                    MON->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
+                const double PY =
+                    MON->m_size.y * 0.5 - g_cfgSpawnHeight * 0.5;
 
-            g_fsLastFSWindow = FSW;
-        }
+                Compat::setWindowBox(
+                    FSW,
+                    CBox{MON->m_position.x + PX, MON->m_position.y + PY,
+                         g_cfgSpawnWidth, g_cfgSpawnHeight});
+
+                // Room-driven ghost, same as the session newcomers: the
+                // enforcer holds the spawn box, the ghost-toggle fixup
+                // guards the floating flag.
+                g_roomBoxes[Compat::windowId(FSW)] =
+                    CBox{PX, PY, g_cfgSpawnWidth, g_cfgSpawnHeight};
+                g_boxDriven.insert(Compat::windowId(FSW));
+
+                g_layoutSaves.clear(); // no stale saves may survive into this session
+
+                auto SAVE = Compat::saveWindowLayout(FSW);
+
+                if (SAVE.window) {
+                    Compat::applyWindowGhost(SAVE);
+                    g_layoutSaves.push_back(std::move(SAVE));
+                }
+
+                g_fsLastFSWindow = FSW;
+            }
 
         g_fsWasOn =
             Fullscreen::controller()->getFullscreenWindow(MON) != nullptr;
@@ -2654,6 +3631,8 @@ static void toggle3D() {
 
     if (g_transitionTarget > 0.5f)
         enter3D();
+    else
+        beginExit3D();
 
     damageCurrentMonitor();
 
@@ -2676,6 +3655,7 @@ static void open3D() {
 
 static void close3D() {
     g_transitionTarget = 0.0f;
+    beginExit3D();
     damageCurrentMonitor();
 
     notify(
@@ -2687,10 +3667,16 @@ static void close3D() {
 static float updateTransition() {
     const auto now = std::chrono::steady_clock::now();
 
-    const float dt =
+    float dt =
         std::chrono::duration<float>(now - g_lastTick).count();
 
     g_lastTick = now;
+
+    // The tick clock runs only while the room renders. The first frame
+    // after a toggle carries the WHOLE 2D idle time as dt -- unclamped it
+    // would snap the transition to its target on frame one and the morph
+    // (or the old fade) would never be seen at all.
+    dt = std::clamp(dt, 0.0f, 0.1f);
 
     constexpr float duration = 0.55f;
     constexpr float speed = 1.0f / duration;
@@ -2700,7 +3686,7 @@ static float updateTransition() {
     else if (g_transition > g_transitionTarget)
         g_transition = std::max(g_transition - dt * speed, 0.0f);
 
-    return std::clamp(dt, 0.0f, 0.1f);
+    return dt;
 }
 
 // --- frame ------------------------------------------------------------------
@@ -2794,7 +3780,7 @@ static void update3D(float dt) {
     // Release capture unconditionally when the view no longer owns input, so
     // a disappearing monitor or a closing transition can never strand the
     // pointer in captured mode.
-    Compat::setPointerCapture(g_hookInstalled && ownsInput());
+    Compat::setPointerCapture(captureWanted());
 
     float yawDelta = 0.0f;
     float pitchDelta = 0.0f;
@@ -2806,6 +3792,14 @@ static void update3D(float dt) {
     g_input.setLookSmoothing(g_cfgLookInertia);
     g_scene.camera().moveSpeed = g_cfgMoveSpeed;
     g_input.setSensitivity(g_cfgSensitivity);
+
+    // Silhouette traces wait while a transition drives the boxes every
+    // frame; the stale/settle cadence re-traces at full resolution on the
+    // first steady frames after it ends.
+    g_capture.setSkirtDeferred(
+        g_viewMorph != EViewMorph::None ||
+        g_fsPhase == EFullscreenPhase::To2D ||
+        g_fsPhase == EFullscreenPhase::To3D);
 
     // Map: the scene owns the file/GL side; collision rebuilds its BVH
     // whenever the map (re)loaded.
@@ -3131,7 +4125,8 @@ static void update3D(float dt) {
         const float BOB_SPEED = std::sqrt(s_moveVel.x * s_moveVel.x +
                                           s_moveVel.z * s_moveVel.z);
         const bool BOBING = g_cfgWalkBob && !g_playerFlying && g_grounded &&
-            g_fsPhase == EFullscreenPhase::None && g_viewMode == 0;
+            g_fsPhase == EFullscreenPhase::None &&
+            g_viewMorph == EViewMorph::None && g_viewMode == 0;
         const float TARGET_AMP =
             BOBING ? kBobAmplitude *
                 std::min(1.0f, BOB_SPEED / std::max(CAM.moveSpeed, 0.5f))
@@ -3254,7 +4249,7 @@ static void update3D(float dt) {
     // consecutive frames, outlasting ANY late Hyprland-side restore.
     if (g_fsAssertFrames > 0) {
         if (auto W = g_fsWindow.lock()) {
-            Compat::setWindowBox(W, g_fsAssertBox);
+            Compat::driveWindowBox(W, g_fsAssertBox);
 
             const auto CUR = Compat::currentWindowBox(W);
 
@@ -3294,14 +4289,95 @@ static void update3D(float dt) {
         updateWheelRoll();
     }
 
+    // The room-box enforcer: the room and the 2D layout are separate
+    // universes. Whatever Hyprland wrote into a frozen window's box -- a
+    // tree reflow (a spawn, a float toggle), a floating recalc, a
+    // remembered-size restore on a fullscreen exit -- is reverted within
+    // this tick. A TILED window's divergence is the tree speaking: the new
+    // box is where 2D wants the window NOW, so the layout save is refreshed
+    // and the exit flight lands exactly where the settle recalc would put
+    // the window. Floating windows the room never drove stay live.
+    if (g_viewMorph == EViewMorph::None && g_fsPhase == EFullscreenPhase::None &&
+        g_fsAssertFrames == 0) {
+        // A float/tile toggle aimed at a GHOSTED window (the keybind hits
+        // the focused window, and ghosts can be aimed): Hyprland's
+        // toggleTargetFloating unconditionally inserts the target into the
+        // algorithm -- for a ghost that is an INVISIBLE node holding tree
+        // space: the empty tile that slowly eats the 2D layout. Eject it
+        // and restore the floating-panel state every ghost carries.
+        if (!g_layoutSaves.empty()) {
+            for (const auto& SAVE : g_layoutSaves)
+                Compat::fixupGhostedWindow(SAVE);
+        }
+
+        if (!g_roomBoxes.empty()) {
+            std::vector<std::uintptr_t> closed;
+
+            for (const auto& [ID, BOX] : g_roomBoxes) {
+                const auto W = Compat::findWindowById(ID);
+
+                if (!W) {
+                    closed.push_back(ID);
+                    continue;
+                }
+
+                if (ID == g_fsCurrentId || !W->m_target)
+                    continue;
+
+                const bool FLOATING = W->m_target->floating();
+
+                if (FLOATING && !g_boxDriven.count(ID))
+                    continue; // live box: client resizes stay visible
+
+                const auto CUR = Compat::currentWindowBox(W);
+
+                const bool diverges =
+                    std::fabs(CUR.x - (BOX.x + MON->m_position.x)) > 0.5 ||
+                    std::fabs(CUR.y - (BOX.y + MON->m_position.y)) > 0.5 ||
+                    std::fabs(CUR.w - BOX.w) > 0.5 ||
+                    std::fabs(CUR.h - BOX.h) > 0.5;
+
+                if (!diverges)
+                    continue;
+
+                if (!FLOATING) {
+                    for (auto& SAVE : g_layoutSaves) {
+                        if (SAVE.id != ID)
+                            continue;
+
+                        SAVE.box = CUR; // the tree's current 2D truth
+                        break;
+                    }
+                }
+
+                Compat::driveWindowBox(
+                    W,
+                    CBox{BOX.x + MON->m_position.x, BOX.y + MON->m_position.y,
+                         BOX.w, BOX.h});
+            }
+
+            for (const auto ID : closed)
+                g_roomBoxes.erase(ID);
+        }
+    }
+
     syncWorld(MON, dt);
 
     applyFullscreenAnimation();
 
+    // The 2D<->3D view morph: runs after syncWorld and overrides the quad
+    // poses (same slot the fullscreen animation occupies -- the two never
+    // run together, applyViewMorph lands instantly when a FS phase starts).
+    applyViewMorph(MON);
+
     // Normal client interaction is a virtual pointer located exactly at the
     // crosshair. It is updated every frame after camera motion, so buttons,
     // text fields, scrollbars, etc. receive ordinary Wayland pointer motion.
-    if (!g_pointerDown && g_fsPhase == EFullscreenPhase::None)
+    // Frozen during transitions: the flying quads sweep the crosshair across
+    // whatever sits behind them. Typing mode: the pointer drives the plugin's
+    // cursor instead.
+    if (!g_pointerDown && g_fsPhase == EFullscreenPhase::None &&
+        g_viewMorph == EViewMorph::None && !pointerFree())
         forwardPointerToAim(inputTimeMs());
 }
 
@@ -3500,6 +4576,10 @@ static void dumpStatus() {
         << " transition=" << g_transition
         << " target=" << g_transitionTarget
         << " alphaSent=" << g_diagAlpha
+        << " morph=" << static_cast<int>(g_viewMorph)
+        << " morphS=" << g_morphS
+        << " morphWins=" << g_viewMorphWins.size()
+        << " savedPoses=" << g_savedPoses.size()
         << " renderedOnce=" << (g_renderedOnce ? 1 : 0) << "\n";
 
     out << "hookInstalled=" << (g_hookInstalled ? 1 : 0)
@@ -3525,6 +4605,60 @@ static void dumpStatus() {
     // and Pointer::mgr()'s position are different quantities and only one of
     // them can be used to derive a delta.
     out << "mgrPos=" << g_diagMgrPos.x << "," << g_diagMgrPos.y << "\n";
+
+    // Real-resize state: the driven goal vs the enforcer's room box vs the
+    // snapshot box. The snapshot box feeding the quad while the drive holds
+    // a different box (or the reverse) is the resize-desync signature.
+    if (g_resize.active && g_resize.window) {
+        const auto  CUR    = Compat::currentWindowBox(g_resize.window);
+        const auto* ENTY   = g_world.find(g_resize.id);
+        const auto* SNAP   = g_capture.get(g_resize.id);
+        const auto  ROOMIT = g_roomBoxes.find(g_resize.id);
+
+        out << "resizeWin=" << g_resize.id
+            << " goal=" << CUR.x << "," << CUR.y << "," << CUR.w << ","
+            << CUR.h;
+
+        // The animated content box (what the snapshot actually renders at)
+        // vs the driven goal: a persistent gap means the warp is not
+        // landing or something keeps re-animating the window.
+        if (g_resize.window) {
+            const auto SURF = g_resize.window->getWindowMainSurfaceBox();
+
+            out << " surf=" << SURF.x << "," << SURF.y << "," << SURF.w
+                << "," << SURF.h << " reported="
+                << g_resize.window->m_reportedSize.x << ","
+                << g_resize.window->m_reportedSize.y;
+        }
+
+        if (ROOMIT != g_roomBoxes.end())
+            out << " roomBox=" << ROOMIT->second.x << ","
+                << ROOMIT->second.y << "," << ROOMIT->second.w << ","
+                << ROOMIT->second.h;
+
+        if (SNAP)
+            out << " snapBox=" << SNAP->sampledBox.x << ","
+                << SNAP->sampledBox.y << "," << SNAP->sampledBox.w << ","
+                << SNAP->sampledBox.h << " texSpan=" << SNAP->texSpan.x
+                << "," << SNAP->texSpan.y
+                << " bigTex=" << (SNAP->bigTex ? 1 : 0);
+
+        if (ENTY)
+            out << " quadW=" << ENTY->width << " quadH=" << ENTY->height;
+
+        const auto MINR = g_resize.window->minSize().value_or(Vector2D{1, 1});
+        const auto MAXR = g_resize.window->maxSize().value_or(
+            Vector2D{INFINITY, INFINITY});
+
+        out << " drives=" << g_diagResizeDrives << " lastDrive="
+            << g_diagLastResizeBox.x << "," << g_diagLastResizeBox.y << ","
+            << g_diagLastResizeBox.w << "," << g_diagLastResizeBox.h
+            << " min=" << MINR.x << "x" << MINR.y << " max=" << MAXR.x << "x"
+            << MAXR.y;
+
+        out << " grab=" << g_resize.grabPx.x << "," << g_resize.grabPx.y
+            << " edges=" << g_resize.edgeX << "," << g_resize.edgeY << "\n";
+    }
 
     const Vector2D CENTER = crosshairLogical();
 
@@ -3650,6 +4784,23 @@ static void dumpStatus() {
 
     out << "captureFrames=" << g_captureFrames << "\n";
 
+    {
+        const auto& REQ = Compat::lastCursorRequest();
+        SP<Render::ITexture> TEX;
+        Vector2D SIZE, HOT;
+        const bool OK = clientCursorImage(TEX, SIZE, HOT);
+
+        out << "cursorImage: serial=" << REQ.serial
+            << " kind=" << (REQ.buffer ? "buffer" : REQ.surface ? "surface" : "none")
+            << " usable=" << OK;
+        if (TEX)
+            out << " tex=" << TEX->m_texID << " type=" << (int)TEX->m_type
+                << " texSize=" << TEX->m_size.x << "x" << TEX->m_size.y
+                << " fmt=0x" << std::hex << TEX->m_drmFormat << std::dec;
+        out << " size=" << SIZE.x << "x" << SIZE.y << " hot=" << HOT.x << ","
+            << HOT.y << " vcSpace=" << (int)g_vcSpace << "\n";
+    }
+
     // Player body trace: wall glue, stick-slip or a resync fight show up
     // here directly (position/velocity vs the commanded velocity).
     if (!g_playerBody.IsInvalid() && g_bodyIf) {
@@ -3663,6 +4814,400 @@ static void dumpStatus() {
     }
 }
 
+// --- typing-mode virtual cursor -----------------------------------------------
+//
+// In typing mode the pointer stays captured and drives a cursor of the
+// plugin's own, which lives in one of three spaces:
+//   Window  -- on a window, in the window's own pixels: mouse motion moves it
+//              1:1 across the content whatever the window's angle, the client
+//              gets ordinary pointer input there, and it is drawn in the
+//              window's plane.
+//   Screen  -- off windows, in the room monitor's pixels. Every move casts a
+//              ray through it; crossing a window drops into that window's
+//              space and focuses it.
+//   Desktop -- past the room monitor's edge: capture is released and the real
+//              cursor carries on across the other monitors as usual; coming
+//              back over the room recaptures it.
+// Without the pointer hook there is no relative motion to drive it, and
+// typing mode falls back to the plain free cursor.
+
+// The camera's screen basis, rolled exactly like Camera::view() and with the
+// zoomed fov the scene renders with (same derivation as the panorama).
+struct SViewBasis {
+    Vec3  pos, fwd, right, up;
+    float tanX = 1.0f, tanY = 1.0f;
+};
+
+static SViewBasis viewBasis(const PHLMONITOR& mon) {
+    const auto& CAM = g_scene.camera();
+
+    SViewBasis B;
+    B.pos = CAM.position;
+    B.fwd = CAM.forward();
+
+    const Vec3 RIGHT = CAM.right();
+    const Vec3 UP    = cross(RIGHT, B.fwd);
+
+    B.right = RIGHT * std::cos(CAM.roll) - UP * std::sin(CAM.roll);
+    B.up    = UP * std::cos(CAM.roll) + RIGHT * std::sin(CAM.roll);
+
+    B.tanY = std::tan(kFovDeg * 3.14159265f / 360.0f) /
+        std::max(g_scene.zoom(), 0.01f);
+    B.tanX = B.tanY * static_cast<float>(mon->m_size.x / mon->m_size.y);
+    return B;
+}
+
+static Vec3 screenRay(const PHLMONITOR& mon, const Vector2D& screen) {
+    const auto B = viewBasis(mon);
+
+    const float NX = static_cast<float>(screen.x / mon->m_size.x) * 2.0f - 1.0f;
+    const float NY = 1.0f - static_cast<float>(screen.y / mon->m_size.y) * 2.0f;
+
+    return normalize(B.fwd + B.right * (NX * B.tanX) + B.up * (NY * B.tanY));
+}
+
+static bool projectToScreen(const PHLMONITOR& mon, const Vec3& point,
+                            Vector2D& out) {
+    const auto B = viewBasis(mon);
+    const Vec3 D = point - B.pos;
+    const float Z = dot(D, B.fwd);
+
+    if (Z <= 1e-4f)
+        return false; // behind the camera
+
+    const float NX = dot(D, B.right) / (Z * B.tanX);
+    const float NY = dot(D, B.up) / (Z * B.tanY);
+
+    out = Vector2D{(NX + 1.0f) * 0.5f * mon->m_size.x,
+                   (1.0f - NY) * 0.5f * mon->m_size.y};
+    return true;
+}
+
+// World point of a decorated-box px position on an entity (it may lie
+// outside the box, on the window's plane).
+static Vec3 windowPoint(const World3D::SEntity& e, const Vector2D& local) {
+    const float X =
+        (static_cast<float>(local.x) / e.logicalWidth - 0.5f) * e.width;
+    const float Y =
+        (0.5f - static_cast<float>(local.y) / e.logicalHeight) * e.height;
+
+    return e.center + g_world.rightOf(e.id) * X + g_world.upOf(e.id) * Y;
+}
+
+// Decorated-box px -> client-surface px, the border ring clamped to the
+// surface edge (the same mapping as localFromHit).
+static Vector2D surfaceLocal(const World3D::SEntity& e, const Vector2D& local) {
+    return {
+        std::clamp(local.x - e.surfaceOffsetX, 0.0, (double)e.surfaceWidth),
+        std::clamp(local.y - e.surfaceOffsetY, 0.0, (double)e.surfaceHeight),
+    };
+}
+
+static void vcDeliverMotion() {
+    const auto* E = g_world.find(g_vcId);
+    if (!E)
+        return;
+
+    const auto TARGET = targetFromHit(g_vcId);
+    const auto LOCAL  = surfaceLocal(*E, g_vcLocal);
+
+    if (TARGET.layer)
+        Compat::deliverMotion(TARGET.layer, LOCAL, inputTimeMs());
+    else if (TARGET.window)
+        Compat::deliverMotion(TARGET.window, LOCAL, inputTimeMs());
+}
+
+static void vcEnterWindow(const World3D::SHit& hit) {
+    const auto* E = g_world.find(hit.id);
+    if (!E)
+        return;
+
+    g_vcSpace = ECursorSpace::Window;
+    g_vcId    = hit.id;
+    g_vcLocal = Vector2D{std::clamp(hit.u, 0.0f, 1.0f) * E->logicalWidth,
+                         std::clamp(hit.v, 0.0f, 1.0f) * E->logicalHeight};
+
+    // Focus follows the cursor; layers (bars, panels) never take it, and a
+    // layer holding the keyboard (a launcher) keeps it until a click.
+    const auto TARGET = targetFromHit(hit.id);
+    if (TARGET.window && g_lastFocusId != hit.id &&
+        !Compat::layerHasKeyboardFocus()) {
+        Compat::focusWindow(TARGET.window);
+        g_lastFocusId = hit.id;
+    }
+
+    vcDeliverMotion();
+}
+
+static PHLMONITOR monitorAt(const Vector2D& global) {
+    if (!State::monitorState())
+        return nullptr;
+
+    for (const auto& MON : State::monitorState()->monitors()) {
+        if (MON && CBox{MON->m_position, MON->m_size}.containsPoint(global))
+            return MON;
+    }
+
+    return nullptr;
+}
+
+static void vcLeaveToDesktop(const Vector2D& global) {
+    Compat::clearPointerFocus();
+
+    g_vcSpace = ECursorSpace::Desktop;
+    g_vcId    = 0;
+
+    // The desktop's focus-follows-mouse takes over; re-entering any room
+    // window, even the one just left, must focus it again.
+    g_lastFocusId = 0;
+
+    Compat::setPointerCapture(false);
+    Pointer::mgr()->warpTo(global);
+    Compat::setCursorHidden(false);
+
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->setCursorFromName("default", true);
+}
+
+// Screen space at g_vcScreen: leave for a neighbouring monitor past the edge
+// (clamp where there is none), else drop into whatever window is under it.
+static void vcResolveScreen(const PHLMONITOR& mon) {
+    const Vector2D SIZE = mon->m_size;
+
+    if (g_vcScreen.x < 0 || g_vcScreen.y < 0 || g_vcScreen.x >= SIZE.x ||
+        g_vcScreen.y >= SIZE.y) {
+        const Vector2D GLOBAL = mon->m_position + g_vcScreen;
+
+        if (const auto NEXT = monitorAt(GLOBAL); NEXT && NEXT != mon) {
+            vcLeaveToDesktop(GLOBAL);
+            return;
+        }
+
+        g_vcScreen = Vector2D{std::clamp(g_vcScreen.x, 0.0, SIZE.x - 1),
+                              std::clamp(g_vcScreen.y, 0.0, SIZE.y - 1)};
+    }
+
+    // A bar, sidebar, launcher or notification drawn over the room: hand
+    // the pointer to the real cursor there, Hyprland drives it natively.
+    if (const Vector2D GLOBAL = mon->m_position + g_vcScreen;
+        g_cfgUnderLayers && Compat::interactiveLayerAt(mon, GLOBAL)) {
+        vcLeaveToDesktop(GLOBAL);
+        return;
+    }
+
+    const World3D::SHit HIT = pickVisible(screenRay(mon, g_vcScreen));
+
+    if (HIT.hit) {
+        vcEnterWindow(HIT);
+        return;
+    }
+
+    if (g_vcSpace == ECursorSpace::Window)
+        Compat::clearPointerFocus();
+
+    g_vcSpace = ECursorSpace::Screen;
+    g_vcId    = 0;
+}
+
+static void vcMove(double dx, double dy) {
+    const auto MON = targetMonitor();
+    if (!MON)
+        return;
+
+    if (g_vcSpace == ECursorSpace::Window) {
+        const auto* E = g_world.find(g_vcId);
+
+        if (E && E->logicalWidth > 0 && E->logicalHeight > 0) {
+            Vector2D next = g_vcLocal + Vector2D{dx, dy};
+
+            // A held button keeps the window: a drag-select runs to the
+            // edge and stays there, like on a flat desktop.
+            if (g_clientButtonDown) {
+                next = Vector2D{std::clamp(next.x, 0.0, (double)E->logicalWidth),
+                                std::clamp(next.y, 0.0, (double)E->logicalHeight)};
+                g_vcLocal = next;
+                g_clientButtonLocal = surfaceLocal(*E, g_vcLocal);
+                vcDeliverMotion();
+                return;
+            }
+
+            const bool INSIDE = next.x >= 0 && next.y >= 0 &&
+                next.x <= E->logicalWidth && next.y <= E->logicalHeight;
+
+            Vector2D projected;
+            const bool ON_SCREEN =
+                projectToScreen(MON, windowPoint(*E, next), projected);
+
+            if (INSIDE) {
+                // The part of the window under a bar is the bar's.
+                if (ON_SCREEN && g_cfgUnderLayers &&
+                    Compat::interactiveLayerAt(MON, MON->m_position + projected)) {
+                    g_vcScreen = projected;
+                    vcLeaveToDesktop(MON->m_position + projected);
+                    return;
+                }
+
+                g_vcLocal = next;
+                if (ON_SCREEN)
+                    g_vcScreen = projected;
+                vcDeliverMotion();
+                return;
+            }
+
+            // Off the window's edge: carry on in screen space from where the
+            // exit point appears on screen.
+            if (ON_SCREEN)
+                g_vcScreen = projected;
+        }
+
+        Compat::clearPointerFocus();
+        g_vcSpace = ECursorSpace::Screen;
+        g_vcId    = 0;
+        vcResolveScreen(MON);
+        return;
+    }
+
+    if (g_vcSpace != ECursorSpace::Screen)
+        return;
+
+    g_vcScreen = g_vcScreen + Vector2D{dx, dy};
+    vcResolveScreen(MON);
+}
+
+// Typing mode starts at the crosshair: whatever the view was aiming at is
+// already under the cursor.
+static void vcBegin() {
+    const auto MON = targetMonitor();
+
+    g_vcSpace = ECursorSpace::Screen;
+    g_vcId    = 0;
+
+    if (!MON)
+        return;
+
+    g_vcScreen = MON->m_size * 0.5;
+    vcResolveScreen(MON);
+}
+
+// The real cursor came back over the room: capture it there again.
+static void vcEnterFromDesktop(const Vector2D& global) {
+    const auto MON = targetMonitor();
+    if (!MON)
+        return;
+
+    g_vcScreen = global - MON->m_position;
+    g_vcSpace  = ECursorSpace::Screen;
+
+    // Pointer focus still sits on the desktop window the cursor came from.
+    Compat::clearPointerFocus();
+    Compat::setPointerCapture(true);
+
+    if (Compat::setCursorHidden(true))
+        Pointer::mgr()->resetCursorImage();
+
+    vcResolveScreen(MON);
+}
+
+// The client's cursor image, recorded by the pointer hooks while the real
+// cursor is hidden. A theme or cursor-shape cursor arrives as a buffer and is
+// uploaded once per request here, in render.pre (outside the frame's pass); a
+// client-drawn cursor surface already carries its texture.
+static uint64_t             g_cursorSerial = 0;
+static SP<Render::ITexture> g_cursorBufferTex;
+
+// Kept alive until the next frame: the scene samples it inside the pass.
+static SP<Render::ITexture> g_cursorTexHold;
+
+static void refreshCursorImage() {
+    const auto& REQ = Compat::lastCursorRequest();
+
+    if (REQ.serial == g_cursorSerial)
+        return;
+
+    g_cursorSerial = REQ.serial;
+    g_cursorBufferTex.reset();
+
+    if (REQ.buffer && g_pHyprRenderer) {
+        if (Render::GL::g_pHyprOpenGL)
+            Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+
+        g_cursorBufferTex = g_pHyprRenderer->createTexture(REQ.buffer);
+    }
+}
+
+// The current client cursor image: texture, logical size and hotspot. Only
+// plain RGBA textures; an external (EGLImage) one needs a different sampler,
+// and the built-in arrow stands in for it.
+static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
+                              Vector2D& hotspot) {
+    const auto& REQ = Compat::lastCursorRequest();
+
+    if (const auto SURF = REQ.surface.lock()) {
+        const auto RES = SURF->resource();
+        if (!RES)
+            return false;
+
+        tex  = RES->m_current.texture;
+        size = RES->m_current.size;
+    } else if (REQ.buffer && g_cursorBufferTex) {
+        tex  = g_cursorBufferTex;
+        size = REQ.buffer->size / REQ.scale;
+    } else
+        return false;
+
+    hotspot = REQ.hotspot;
+
+    return tex && tex->m_texID != 0 && size.x > 0 && size.y > 0 &&
+        (tex->m_type == Render::TEXTURE_RGBA ||
+         tex->m_type == Render::TEXTURE_RGBX);
+}
+
+// Where the scene draws the virtual cursor this frame.
+static void updatePointerVisual() {
+    GLScene::SPointer P;
+
+    const auto MON = targetMonitor();
+
+    if (virtualCursor() && MON && g_vcSpace != ECursorSpace::Desktop) {
+        const auto* E = g_vcSpace == ECursorSpace::Window ?
+            g_world.find(g_vcId) : nullptr;
+
+        if (E && E->logicalWidth > 0) {
+            P.mode    = GLScene::SPointer::EMode::World;
+            P.tip     = windowPoint(*E, g_vcLocal);
+            P.right   = g_world.rightOf(E->id);
+            P.down    = g_world.upOf(E->id) * -1.0f;
+            P.pxWorld = E->width / E->logicalWidth;
+
+            // On a window it shows what that client asked for (text beam,
+            // resize arrows, hand...), in the window's plane.
+            SP<Render::ITexture> TEX;
+            Vector2D SIZE, HOT;
+            if (clientCursorImage(TEX, SIZE, HOT)) {
+                g_cursorTexHold = TEX;
+                P.texture = TEX->m_texID;
+                P.texW    = static_cast<float>(SIZE.x);
+                P.texH    = static_cast<float>(SIZE.y);
+                P.hotX    = static_cast<float>(HOT.x);
+                P.hotY    = static_cast<float>(HOT.y);
+            }
+        } else {
+            // The window went away under the cursor: the next move
+            // re-resolves from the last screen point.
+            if (g_vcSpace == ECursorSpace::Window) {
+                g_vcSpace = ECursorSpace::Screen;
+                g_vcId    = 0;
+            }
+
+            P.mode = GLScene::SPointer::EMode::Screen;
+            P.ndcX = static_cast<float>(g_vcScreen.x / MON->m_size.x) * 2.0f - 1.0f;
+            P.ndcY = 1.0f - static_cast<float>(g_vcScreen.y / MON->m_size.y) * 2.0f;
+        }
+    }
+
+    g_scene.setPointer(P);
+}
+
 static void onRenderStage(eRenderStage stage) {
     if (g_capturing)
         return;
@@ -3673,11 +5218,20 @@ static void onRenderStage(eRenderStage stage) {
     if (!g_monitor)
         return;
 
-    if (stage != RENDER_LAST_MOMENT)
+    // world.under_layers: after the windows, before the top and overlay
+    // layers -- bars, launchers and notifications draw over the room as
+    // ordinary 2D. Otherwise the room covers everything.
+    if (stage != (g_cfgUnderLayers ? RENDER_POST_WINDOWS : RENDER_LAST_MOMENT))
         return;
 
     if (!g_currentRenderMon || g_currentRenderMon != g_monitor)
         return;
+
+    // The stage fires per rendered workspace (two during a workspace
+    // switch); the room is drawn once per frame.
+    if (g_roomDrawnThisFrame)
+        return;
+    g_roomDrawnThisFrame = true;
 
     dumpStatus();
 
@@ -3685,7 +5239,14 @@ static void onRenderStage(eRenderStage stage) {
 
     if (g_transition <= 0.0f && g_transitionTarget <= 0.0f) {
         requestDeactivate3D();
-        return;
+
+        // No morph running: nothing covers the desktop, stop rendering.
+        if (g_viewMorph == EViewMorph::None)
+            return;
+
+        // The exit morph just drained: draw ONE more frame at s=0 -- the
+        // quads sit exactly on the 2D rectangles and cover the gap until
+        // the deferred teardown restores the real windows.
     }
 
     if (!g_pHyprRenderer)
@@ -3705,10 +5266,16 @@ static void onRenderStage(eRenderStage stage) {
         std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - U3_T0).count() * 0.1;
 
-    g_diagAlpha = std::clamp(g_transition, 0.0f, 1.0f);
+    // Composite alpha: the view morph needs the scene opaque from its first
+    // frame (the windows land exactly on the 2D rectangles; the environment
+    // fades per-pixel inside the scene instead). The fullscreen passthrough
+    // keeps its own minimal handoff fades.
+    g_diagAlpha = 1.0f;
 
     if (g_fsPhase == EFullscreenPhase::To2D || g_fsPhase == EFullscreenPhase::To3D)
         g_diagAlpha = g_fsAlpha;
+
+    updatePointerVisual();
 
     g_pHyprRenderer->addPassElement(
         makeUnique<CHypr3DPassElement>(
@@ -3730,12 +5297,116 @@ static bool hookSink(double dx, double dy) {
     return onPointerMotion(dx, dy);
 }
 
+static void setKeyboardMode(EKeyboardMode mode) {
+    if (g_keyboardMode == mode)
+        return;
+
+    g_keyboardMode = mode;
+
+    // Both directions start from the crosshair: the cursor appears where the
+    // view was aiming, and returning puts it back on the room monitor (it may
+    // have wandered to another one).
+    Pointer::mgr()->warpTo(crosshairLogical());
+
+    if (pointerFree()) {
+        resetCameraKeys(); // held camera keys must not keep walking
+        resetPointerGesture();
+        finishClientButton(inputTimeMs());
+        g_input.reset(); // drop pending look: the view stops dead
+
+        Compat::clearPointerFocus();
+
+        if (virtualCursor()) {
+            // The pointer stays captured and drives the plugin's cursor.
+            vcBegin();
+        } else {
+            Compat::setPointerCapture(false);
+            Compat::setCursorHidden(false);
+
+            if (g_pHyprRenderer)
+                g_pHyprRenderer->setCursorFromName("default", true);
+
+            g_freeOnRoom = true;
+        }
+    } else {
+        finishClientButton(inputTimeMs());
+        Compat::clearPointerFocus();
+        g_vcSpace = ECursorSpace::Desktop;
+        g_vcId    = 0;
+
+        Compat::setPointerCapture(g_hookInstalled && ownsInput());
+
+        if (Compat::setCursorHidden(true))
+            Pointer::mgr()->resetCursorImage();
+
+        // Hand the keyboard back to the aimed window: another monitor may
+        // have taken focus while the cursor was over there.
+        g_lastFocusId = 0;
+    }
+
+    g_scene.setCrosshairVisible(!pointerFree());
+
+    notify(
+        g_keyboardMode == EKeyboardMode::Space ?
+            "[hypr3d] keyboard: space (wasd / space / shift / ctrl)" :
+        !pointerFree() ?
+            "[hypr3d] keyboard: window (typing reaches the focused window)" :
+        virtualCursor() ?
+            "[hypr3d] typing: cursor on the windows (toggle again to return)" :
+            "[hypr3d] typing: free cursor (toggle again / click the room to return)",
+        CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
+    );
+
+    damageCurrentMonitor();
+}
+
 static void onMouseMove(Vector2D pos, Event::SCallbackInfo& info) {
     ++g_diagMoveEvents;
     g_diagLastPos = pos;
 
     if (!ownsInput())
         return;
+
+    if (virtualCursor()) {
+        // In the room the hook owns the motion. Out on the desktop the
+        // ordinary cursor runs until it comes back over the room.
+        if (g_vcSpace == ECursorSpace::Desktop) {
+            // Over a layer on the room monitor the real cursor stays: the
+            // bar and its popups get ordinary input.
+            if (onRoomMonitor(pos) &&
+                !(g_cfgUnderLayers &&
+                  Compat::interactiveLayerAt(targetMonitor(), pos))) {
+                vcEnterFromDesktop(pos);
+                info.cancelled = true;
+            }
+            return;
+        }
+
+        info.cancelled = true;
+        return;
+    }
+
+    if (pointerFree()) {
+        // Over the room, the 2D windows under the cursor are the ghosted
+        // originals the scene hides: keep Hyprland's hover and
+        // focus-follows-mouse off them, so typing stays on the aimed window.
+        // Elsewhere it is the ordinary desktop.
+        const bool ON_ROOM = onRoomMonitor(pos);
+
+        if (ON_ROOM && !g_freeOnRoom) {
+            Compat::clearPointerFocus();
+
+            if (g_pHyprRenderer)
+                g_pHyprRenderer->setCursorFromName("default", true);
+        }
+
+        g_freeOnRoom = ON_ROOM;
+
+        if (ON_ROOM)
+            info.cancelled = true;
+
+        return;
+    }
 
     if (g_hookInstalled && g_diagSinkCalls > 0) {
         // The relative hook already owns the real delta. The absolute event is
@@ -3765,6 +5436,30 @@ static void onMouseAxis(
 ) {
     if (!ownsInput())
         return;
+
+    // Virtual cursor: scroll the window under it; empty space swallows it.
+    if (virtualCursor()) {
+        if (g_vcSpace == ECursorSpace::Desktop)
+            return;
+
+        info.cancelled = true;
+
+        if (g_vcSpace == ECursorSpace::Window) {
+            vcDeliverMotion();
+            Compat::deliverAxis(event.timeMs, event.axis, event.delta,
+                                event.deltaDiscrete, event.source,
+                                event.relativeDirection);
+        }
+        return;
+    }
+
+    // Free cursor: scrolling belongs to the desktop, never to the hidden
+    // 2D windows under the room.
+    if (pointerFree()) {
+        if (onRoomMonitor(Pointer::mgr()->position()))
+            info.cancelled = true;
+        return;
+    }
 
     if (event.axis != WL_POINTER_AXIS_VERTICAL_SCROLL)
         return;
@@ -3936,6 +5631,82 @@ static void onMouseButton(
 
     const bool PRESSED =
         event.state == WL_POINTER_BUTTON_STATE_PRESSED;
+
+    if (!PRESSED && g_swallowRelease == event.button) {
+        g_swallowRelease = 0;
+        info.cancelled = true;
+        return;
+    }
+
+    // input.typing_button switches between moving and typing.
+    if (g_cfgTypingButton && event.button == g_cfgTypingButton) {
+        if (PRESSED) {
+            setKeyboardMode(g_keyboardMode == EKeyboardMode::Window ?
+                                EKeyboardMode::Space :
+                                EKeyboardMode::Window);
+            g_swallowRelease = event.button;
+        }
+
+        info.cancelled = true;
+        return;
+    }
+
+    // Virtual cursor: buttons go to the window under it, natively. Empty
+    // space swallows them; out on the desktop they are ordinary clicks.
+    if (virtualCursor()) {
+        if (g_vcSpace == ECursorSpace::Desktop)
+            return;
+
+        info.cancelled = true;
+
+        if (!PRESSED) {
+            if (g_clientButtonDown && event.button == g_clientButton)
+                finishClientButton(event.timeMs);
+            return;
+        }
+
+        if (g_vcSpace != ECursorSpace::Window || g_clientButtonDown)
+            return;
+
+        const auto* E = g_world.find(g_vcId);
+        const auto TARGET = targetFromHit(g_vcId);
+
+        if (!E || (!TARGET.window && !TARGET.layer))
+            return;
+
+        const auto LOCAL = surfaceLocal(*E, g_vcLocal);
+
+        // A click focuses, as on the desktop -- also taking the keyboard
+        // back from a launcher or sidebar.
+        if (TARGET.window) {
+            Compat::focusWindow(TARGET.window);
+            g_lastFocusId = g_vcId;
+        }
+
+        if (TARGET.layer)
+            Compat::deliverClick(TARGET.layer, LOCAL, event.button, true, event.timeMs);
+        else
+            Compat::deliverClick(TARGET.window, LOCAL, event.button, true, event.timeMs);
+
+        g_clientButtonWindow = TARGET.window;
+        g_clientButtonLayer  = TARGET.layer;
+        g_clientButton       = event.button;
+        g_clientButtonLocal  = LOCAL;
+        g_clientButtonDown   = true;
+        return;
+    }
+
+    // Free cursor: clicks on other monitors are ordinary desktop clicks. A
+    // press on the room returns to moving and never reaches a client.
+    if (pointerFree()) {
+        if (PRESSED && onRoomMonitor(Pointer::mgr()->position())) {
+            setKeyboardMode(EKeyboardMode::Space);
+            g_swallowRelease = event.button;
+            info.cancelled = true;
+        }
+
+        return;
+    }
 
     // Release the plugin gesture that owns this physical button.
     if (!PRESSED && g_pointerDown && event.button == g_pointerButton) {
@@ -4110,7 +5881,7 @@ static void onMouseButton(
         const auto& CAM = g_scene.camera();
 
         if (TARGET.window)
-            Compat::focusWindow(TARGET.window);
+            focusRoomWindow(TARGET.window);
 
         // Resize is a window-only control: a scene model in front of the
         // crosshair must not let the gesture reach a window behind it.
@@ -4164,8 +5935,8 @@ static void onMouseButton(
             // side relative to the window centre, so the grab lands anywhere
             // on the window and the pull direction decides the rest. As the
             // camera turns, the current centre ray is intersected with this
-            // same window plane, so the real window stretches exactly toward
-            // the point being aimed at.
+            // same window plane, so the quad's room size follows exactly the
+            // point being aimed at -- the real window is untouched.
             // RayHit::v is already top-to-bottom. Top half follows +1,
             // bottom half follows -1 in the CBox edge convention below.
             g_resize.edgeX = HIT.u < 0.5f ? -1 : 1;
@@ -4205,7 +5976,7 @@ static void onMouseButton(
 
     if (PRESSED) {
         if (TARGET.window)
-            Compat::focusWindow(TARGET.window);
+            focusRoomWindow(TARGET.window);
 
         if (TARGET.layer)
             Compat::deliverClick(TARGET.layer, LOCAL, event.button, true, event.timeMs);
@@ -4312,6 +6083,14 @@ static void onKeyboardKey(
     else if (SYM == XKB_KEY_Alt_L)
         g_altHeld = PRESSED;
 
+    // A layer holds the keyboard (launcher, sidebar text field): every key
+    // is its, in both modes. Held camera keys must not keep walking.
+    if (Compat::layerHasKeyboardFocus()) {
+        if (PRESSED)
+            resetCameraKeys();
+        return;
+    }
+
     // Walking mode: Space jumps off whatever the capsule stands on. The
     // held state still reaches setMovementSym, but the walking movement
     // path zeroes the vertical input, so holding Space does not fly.
@@ -4336,20 +6115,10 @@ static void onKeyboardKey(
 
     if (PRESSED && g_superHeld && g_altHeld &&
         (SYM == XKB_KEY_Alt_L || SYM == XKB_KEY_Super_L)) {
-        g_keyboardMode =
+        setKeyboardMode(
             g_keyboardMode == EKeyboardMode::Space ?
                 EKeyboardMode::Window :
-                EKeyboardMode::Space;
-
-        if (g_keyboardMode == EKeyboardMode::Window)
-            resetCameraKeys(); // held camera keys must not keep walking
-
-        notify(
-            g_keyboardMode == EKeyboardMode::Space ?
-                "[hypr3d] keyboard: space (wasd / space / shift / ctrl)" :
-                "[hypr3d] keyboard: window (typing reaches the focused window)",
-            CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
-        );
+                EKeyboardMode::Space);
 
         info.cancelled = true;
         return;
@@ -4387,6 +6156,15 @@ static void onKeyboardKey(
 }
 
 // --- plugin entry -----------------------------------------------------------
+
+// hypr3d.active(): true from open until close. A Lua toggle that also does
+// other things (e.g. switching to a dedicated workspace on the way in and
+// back on the way out) can tell the two states apart without tracking its
+// own state, which a config reload would lose.
+static int luaActive(lua_State* L) {
+    lua_pushboolean(L, g_active && g_transitionTarget > 0.5f);
+    return 1;
+}
 
 static int luaConfig(lua_State* L) {
     // hl.plugin.hypr3d.config({
@@ -4558,6 +6336,8 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.panorama must be a string");
         if (!SET_STRING(idx, "monitor", g_cfgMonitor, "world.monitor"))
             return luaL_error(L, "hypr3d.config: world.monitor must be a string");
+        if (!SET_BOOL(idx, "under_layers", g_cfgUnderLayers, "world.under_layers"))
+            return luaL_error(L, "hypr3d.config: world.under_layers must be a boolean");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
         lua_pop(L, 1);
@@ -4577,10 +6357,81 @@ static int luaConfig(lua_State* L) {
                      "windows.depth"))
             return luaL_error(L, "hypr3d.config: windows.depth must be a number");
 
+        // windows.spawn_size = { x = 960, y = 540 }: the logical box a
+        // window that appears while the view is open starts at.
+        {
+            lua_getfield(L, idx, "spawn_size");
+            if (!lua_isnil(L, -1)) {
+                if (!lua_istable(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(
+                        L, "hypr3d.config: windows.spawn_size must be a table");
+                }
+
+                const auto AXIS = [&](const char* name, float& v) {
+                    lua_getfield(L, -1, name);
+                    if (lua_isnumber(L, -1))
+                        v = static_cast<float>(lua_tonumber(L, -1));
+                    lua_pop(L, 1);
+                };
+
+                AXIS("x", g_cfgSpawnWidth);
+                AXIS("y", g_cfgSpawnHeight);
+
+                if (g_cfgSpawnWidth < 16.0f)
+                    g_cfgSpawnWidth = 16.0f;
+                if (g_cfgSpawnHeight < 16.0f)
+                    g_cfgSpawnHeight = 16.0f;
+            }
+            lua_pop(L, 1);
+        }
+
         // Thickness is a distance: 0 (the default) draws the flat quads,
         // anything below is clamped up to it.
         g_cfgWindowDepth = std::max(0.0f, g_cfgWindowDepth);
 
+        lua_pop(L, 1);
+    }
+
+    // input = { typing_cursor = bool, typing_button = "back" | code }
+    idx = SECTION("input", "input");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: input must be a table");
+    if (idx > 0) {
+        bool cursor = g_cfgTypingCursor;
+        if (!SET_BOOL(idx, "typing_cursor", cursor, "input.typing_cursor"))
+            return luaL_error(L, "hypr3d.config: input.typing_cursor must be a boolean");
+        // Leaving typing mode with the cursor off would strand a freed pointer.
+        if (!cursor && g_cfgTypingCursor && g_keyboardMode == EKeyboardMode::Window)
+            setKeyboardMode(EKeyboardMode::Space);
+        g_cfgTypingCursor = cursor;
+
+        lua_getfield(L, idx, "typing_button");
+        if (lua_type(L, -1) == LUA_TNUMBER)
+            g_cfgTypingButton = static_cast<uint32_t>(lua_tointeger(L, -1));
+        else if (lua_type(L, -1) == LUA_TSTRING) {
+            const std::string NAME = lua_tostring(L, -1);
+            static const std::pair<const char*, uint32_t> NAMES[] = {
+                {"", 0},
+                {"side", BTN_SIDE},       {"extra", BTN_EXTRA},
+                {"forward", BTN_FORWARD}, {"back", BTN_BACK},
+                {"task", BTN_TASK},
+            };
+            bool found = false;
+            for (const auto& [N, CODE] : NAMES)
+                if (NAME == N) {
+                    g_cfgTypingButton = CODE;
+                    found = true;
+                }
+            if (!found) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: input.typing_button must be side, extra, forward, back, task or a button code");
+            }
+        } else if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: input.typing_button must be a name or a button code");
+        }
+        lua_pop(L, 1);
         lua_pop(L, 1);
     }
 
@@ -5088,6 +6939,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
 
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "active", luaActive))
+        throw std::runtime_error("[hypr3d] failed to register Lua active");
+
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");
 
@@ -5220,6 +7074,15 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     clearAimFocus();
 
+    // Positions are per-mode: keep the room's last known arrangement for the
+    // next load -- unless an exit morph is mid-flight (the entity poses are
+    // already at the screen endpoints; beginExit3D saved the room poses).
+    if (g_viewMorph != EViewMorph::To2D)
+        saveViewPoses();
+    g_viewMorph      = EViewMorph::None;
+    g_viewMorphArmed = false;
+    g_viewMorphWins.clear();
+
     g_world.clear();
     g_renderWindows.clear();
 
@@ -5258,6 +7121,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
 
     if (Render::GL::g_pHyprOpenGL) {
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
+        g_cursorBufferTex.reset();
+        g_cursorTexHold.reset();
         g_scene.shutdown();
     }
 }

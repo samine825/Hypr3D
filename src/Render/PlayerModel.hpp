@@ -249,6 +249,9 @@ class CPlayerModel {
     std::vector<SSampler>  m_samplers;
     std::vector<SSkin>     m_skins;
     std::vector<std::vector<Mat4>> m_skinMats; // jointWorld * invBind, per skin
+    // Per skin: true = the mesh node's world goes before the palette (the
+    // bind bakes it in), false = glTF spec (see load()).
+    std::vector<bool>      m_skinMeshWorld;
     std::vector<SPrim>     m_prims;
 
     EState m_state      = EState::Idle;
