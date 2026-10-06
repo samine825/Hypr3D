@@ -130,6 +130,14 @@ static std::unordered_set<std::uintptr_t> g_sessionWindows;
 // itself (a mid-session reflow) is left alone -- the tree owns it.
 static std::unordered_set<std::uintptr_t> g_boxDriven;
 
+// The room box (monitor-local) of every room window, frozen at enter. While
+// the room is open the enforcer in update3D holds windows on these boxes:
+// the 2D layout and the room are separate universes -- a tree reflow, a
+// floating recalc, a remembered-size restore, none of them may move the 3D
+// arrangement. Floating windows the room never drove are exempt (their box
+// is live, client resizes stay visible).
+static std::unordered_map<std::uintptr_t, CBox> g_roomBoxes;
+
 // Pre-existing windows the fullscreen passthrough flew to the screen while
 // the room was open: the passthrough's own setWindowBox calls force-float
 // them, and the exit must flip the flag back (user-initiated floats are not
@@ -1484,13 +1492,21 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // late Hyprland-side restore could pollute the memory with the
         // monitor-sized box, and the NEXT fullscreen cycle would then
         // restore the giant size (the intermittent bug). Also skipped while
-        // the view morph drives the boxes.
+        // the view morph drives the boxes. The monitor-size check covers the
+        // frame between the fullscreen event and the first pump tick:
+        // Hyprland has already stretched the box, but g_fsCurrentId is not
+        // set yet -- and a room window is never monitor-sized, so such a box
+        // is always a fullscreen frame, never memory.
         if (!info.isLayer && info.window &&
             g_fsPhase == EFullscreenPhase::None && g_fsAssertFrames == 0 &&
             g_viewMorph == EViewMorph::None &&
-            info.id != g_fsCurrentId) // a fullscreened window's box is the
-                                      // monitor -- transient, never "stable"
-            g_fsStableBoxes[info.id] = Compat::currentWindowBox(info.window);
+            info.id != g_fsCurrentId) { // a fullscreened window's box is the
+                                        // monitor -- transient, never "stable"
+            const CBox CUR = Compat::currentWindowBox(info.window);
+
+            if (std::fabs(CUR.w - MONW) > 0.5 || std::fabs(CUR.h - MONH) > 0.5)
+                g_fsStableBoxes[info.id] = CUR;
+        }
 
         // Not captured yet means not on screen, and something that is not on
         // screen must not be aimable -- otherwise focus could land on an
@@ -1941,19 +1957,20 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
         g_flagFloated.insert(Compat::windowId(window));
     }
 
-    // The floating box: the POSITION from the stable memory (where the
-    // window lived), the SIZE from Hyprland's own remembered floating size.
-    // When the FS was engaged, Hyprland remembered the pre-fullscreen size
-    // there (setTargetFullscreenModeInternal does it BEFORE stretching the
-    // window to the monitor) -- exactly the size the 2D FS-exit restores.
-    // The stable memory is the fallback (e.g. a tiled window has no
-    // floating history: its tile size is the honest original).
+    // The floating box: the stable memory is the honest pre-fullscreen box
+    // (the room drove it there, and the tracking above skips fullscreen
+    // frames). Hyprland's remembered floating size is the FALLBACK, for a
+    // window never seen at rest: the live box is already the monitor by
+    // then, and setTargetFullscreenModeInternal remembered the pre-FS size
+    // before stretching. Preferring the memory unconditionally pulled stale
+    // sizes from old floating cycles into the restore (tiled windows carry
+    // garbage there) -- the 3D size reset after a fullscreen round-trip.
     if (captureRestoreBox) {
-        const auto IT = g_fsStableBoxes.find(ID);
-        CBox RESTORE = IT != g_fsStableBoxes.end() ?
+        const auto IT   = g_fsStableBoxes.find(ID);
+        CBox       RESTORE = IT != g_fsStableBoxes.end() ?
             IT->second : Compat::currentWindowBox(window);
 
-        if (window->m_target) {
+        if (IT == g_fsStableBoxes.end() && window->m_target) {
             const auto LF = window->m_target->lastFloatingSize();
 
             if (LF.x > 5.0 && LF.y > 5.0)
@@ -2110,30 +2127,22 @@ static void pollFullscreen() {
     }
 
     if (g_fsPhase == EFullscreenPhase::None) {
-        if (FSW && !g_fsWasOn && ownsInput())
-            startTo2D(FSW);
-        else {
-            g_fsWasOn = FSW != nullptr;
+        if (FSW && !g_fsWasOn) {
+            // The FS may engage while the room is still transitioning
+            // (ownsInput() false): leave g_fsWasOn false and start the
+            // passthrough on the first tick the room owns input. Marking it
+            // handled here instead would leave the window monitor-sized in
+            // the room forever -- the passthrough never running at all.
+            if (ownsInput())
+                startTo2D(FSW); // sets g_fsWasOn itself
+        } else if (!FSW) {
+            g_fsWasOn = false;
 
-            // A fullscreen EXITED while the room is plain 3D (no transition
-            // was running -- e.g. the FS predated the 3D entry): make the
-            // window a spawn-sized floating panel AND hold it with the same
-            // condition-driven assert the To3D completion uses -- Hyprland's
-            // floating layout re-applies ITS remembered size (possibly
-            // monitor-sized from an old cycle), and a one-shot set loses to
-            // it.
-            if (!FSW && g_fsWasOn) {
-                if (auto OLDW = g_fsLastFSWindow.lock()) {
-                    const auto CUR = Compat::currentWindowBox(OLDW);
-
-                    g_fsAssertBox    = CBox{CUR.x, CUR.y, kSpawnWidth,
-                                            kSpawnHeight};
-                    g_fsAssertFrames = 1;
-                    g_fsStableCount  = 0;
-
-                    Compat::setWindowBox(OLDW, g_fsAssertBox);
-                }
-            }
+            // A fullscreen EXITED while the room is plain 3D and no
+            // passthrough ever ran for it (it engaged mid-transition):
+            // Hyprland's own FS exit restored the pre-FS box and size --
+            // nothing to drive here. The spawn-size assert this branch used
+            // to run fought the layout for nothing.
         }
 
         g_fsLastFSWindow = FSW;
@@ -2225,8 +2234,14 @@ static void applyFullscreenAnimation() {
         B0.h + (B1.h - B0.h) * p,
     };
 
+    // driveWindowBox, not setWindowBox: the float flip inside setWindowBox
+    // sent a fullscreened TILED window through Hyprland's
+    // changeFloatingMode -- un-FS, floating layout reposition, re-FS -- which
+    // flickered the first fullscreen attempt, wrecked the tile and left the
+    // stale remembered floating size in charge of the restore (the 3D size
+    // reset). The room drives the box either way; the tree stays untouched.
     if (auto W = g_fsWindow.lock())
-        Compat::setWindowBox(W, BOX);
+        Compat::driveWindowBox(W, BOX);
 
     // The quad follows the animated box at the room's pixel density. The
     // fullscreen quad maps 1:1 onto the monitor by definition, so the room's
@@ -2292,7 +2307,7 @@ static void applyFullscreenAnimation() {
                     // The original position AND the pre-fullscreen size:
                     // Hyprland remembered the size when the FS was engaged,
                     // the box lerp above already animated the real box there.
-                    Compat::setWindowBox(W2, g_fsRestoreBox);
+                    Compat::driveWindowBox(W2, g_fsRestoreBox);
 
                     // Hyprland's own fullscreen-exit restore animates the
                     // window toward ITS remembered floating size -- which our
@@ -2412,6 +2427,12 @@ static void buildEnterMorph(
 
         MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
 
+        // Every window's box is frozen at enter: the room is its own
+        // universe. Driven windows are additionally enforced against
+        // floating machinery; ALL tiled windows are enforced against tree
+        // reflows -- a spawn or a float toggle must not re-tile the room.
+        g_roomBoxes[info.id] = MW.boxRoom;
+
         if (MW.animBox)
             g_boxDriven.insert(info.id); // the exit morph undoes this drive
 
@@ -2455,45 +2476,68 @@ static void beginExit3D() {
         SViewMorphWin MW;
 
         // The intended room pose: mid-flight exits keep the destination.
+        bool midEnter = false;
+
         if (auto POSE = PREVIOUS.find(ENTITY.id); POSE != PREVIOUS.end()) {
             MW.roomPose = POSE->second.roomPose;
+            midEnter    = true;
         } else {
             MW.roomPose = SViewPose{
                 ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
         }
 
         // The room's real box rides the memory -- the next entry drives the
-        // real box back to it (sizes are per-mode).
+        // real box back to it (sizes are per-mode). A mid-ENTER exit keeps
+        // the INTENDED box: the live box of a driven window is a flight
+        // frame (a lerp between the 2D and the room box), and saving it
+        // would replace the remembered 3D size with that in-between size --
+        // the rapid-toggle size reset. It also keeps the exit drive
+        // continuous with the enter drive (both lerp between the same two
+        // boxes).
         const auto* SNAPSHOT = g_capture.get(ENTITY.id);
 
         MW.boxRoom = SNAPSHOT ?
             SNAPSHOT->sampledBox :
             CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
                  ENTITY.logicalWidth, ENTITY.logicalHeight};
+
+        if (midEnter && MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0)
+            MW.boxRoom = MW.roomPose.box;
+
+        // A window left fullscreen without the passthrough (the FS engaged
+        // while the room was still transitioning): its live box is the
+        // monitor -- never a room size. The room box memory holds the
+        // honest size.
+        if (ENTITY.id == g_fsCurrentId) {
+            const auto ROOM = g_roomBoxes.find(ENTITY.id);
+
+            if (ROOM != g_roomBoxes.end())
+                MW.boxRoom = ROOM->second;
+            else if (MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0)
+                MW.boxRoom = MW.roomPose.box;
+        }
+
         MW.roomPose.box = MW.boxRoom;
 
         g_savedPoses[ENTITY.id] = MW.roomPose;
 
-        // The 2D box the window must land on. Only windows whose box the
-        // ROOM drove (the enter morph's drive to the remembered room box,
-        // 3D resizes) are animated back to their saved 2D box; a box the
-        // LAYOUT changed mid-session (a reflow after a window opened or
-        // closed) belongs to the tree and is left exactly where the tree
-        // put it.
+        // The 2D box the window must land on: the layout save. The
+        // room-box enforcer refreshes it live whenever the tree re-asserts
+        // (a reflow), so it is always the CURRENT 2D truth -- a reflowed
+        // window lands exactly where the settle recalc will keep it, no
+        // post-landing jump. Ghosted windows (session newcomers, the
+        // pre-fullscreen panel) are owned by their full restore path.
         MW.box2D   = MW.boxRoom;
         MW.animBox = false;
 
-        if (g_boxDriven.count(ENTITY.id)) {
-            for (const auto& SAVE : g_layoutSaves) {
-                if (SAVE.id != ENTITY.id)
-                    continue;
+        for (const auto& SAVE : g_layoutSaves) {
+            if (SAVE.id != ENTITY.id || SAVE.ghosted)
+                continue;
 
-                MW.box2D = viewMorphLocalBox(MON, SAVE.box);
+            MW.box2D   = viewMorphLocalBox(MON, SAVE.box);
+            MW.animBox = boxesDiffer(MW.box2D, MW.boxRoom);
 
-                MW.animBox = boxesDiffer(MW.box2D, MW.boxRoom);
-
-                break;
-            }
+            break;
         }
 
         MW.stack = static_cast<float>(i) * kMorphStackEps;
@@ -2628,6 +2672,16 @@ static void saveViewPoses() {
     for (const auto& E : g_world.entities()) {
         SViewPose POSE{E.center, E.yaw, E.pitch, E.roll,
             CBox{E.logicalLeft, E.logicalTop, E.logicalWidth, E.logicalHeight}};
+
+        // A window left fullscreen (no passthrough ran for it): its live box
+        // is the monitor -- never a room size. Keep the remembered one.
+        if (E.id == g_fsCurrentId) {
+            const auto ROOM = g_roomBoxes.find(E.id);
+
+            if (ROOM != g_roomBoxes.end())
+                POSE.box = ROOM->second;
+        }
+
         g_savedPoses[E.id] = POSE;
     }
 }
@@ -2769,6 +2823,9 @@ static void updateRealResize() {
     // untouched.
     Compat::driveWindowBox(g_resize.window, BOX);
     g_boxDriven.insert(g_resize.id);
+    g_roomBoxes[g_resize.id] =
+        CBox{BOX.x - MON->m_position.x, BOX.y - MON->m_position.y, BOX.w,
+             BOX.h};
 }
 
 static void resetPointerGesture() {
@@ -2928,19 +2985,17 @@ static void deactivate3D() {
     g_viewMorphWins.clear();
     g_morphS = 1.0f;
     g_boxDriven.clear();
+    g_roomBoxes.clear();
     g_flagFloated.clear();
     g_sessionWindows.clear();
     g_capture.setSkirtDeferred(false);
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
     // box if a transition was mid-flight (the window would otherwise stay
-    // monitor-sized). The SIZE is the spawn size -- never the possibly
-    // polluted restore box.
+    // monitor-sized). The restore box is the honest pre-FS box now -- the
+    // drive keeps the window's floating state exactly as it was.
     if (auto W = g_fsWindow.lock())
-        Compat::setWindowBox(
-            W,
-            CBox{g_fsRestoreBox.x, g_fsRestoreBox.y, kSpawnWidth,
-                 kSpawnHeight});
+        Compat::driveWindowBox(W, g_fsRestoreBox);
 
     g_fsPhase        = EFullscreenPhase::None;
     g_fsWindow       = {};
@@ -3005,9 +3060,31 @@ static void enter3D() {
     // windows to boxes from a previous session.
     if (g_ghosted)
         unghostWindows();
+
+    // An interrupted EXIT left the driven windows mid-lerp between the room
+    // and 2D boxes. Land them on their 2D targets now: the fresh session's
+    // first capture becomes the 2D layout memory, and a mid-flight box saved
+    // there would surface as a corrupted layout on the next exit.
+    if (g_viewMorph == EViewMorph::To2D) {
+        if (const auto MON = targetMonitor()) {
+            for (auto& [ID, MW] : g_viewMorphWins) {
+                if (!MW.animBox)
+                    continue;
+
+                if (auto W = Compat::findWindowById(ID))
+                    Compat::driveWindowBox(
+                        W,
+                        CBox{MW.box2D.x + MON->m_position.x,
+                             MW.box2D.y + MON->m_position.y, MW.box2D.w,
+                             MW.box2D.h});
+            }
+        }
+    }
+
     g_layoutSaves.clear();
     g_sessionWindows.clear();
     g_boxDriven.clear();
+    g_roomBoxes.clear();
     g_flagFloated.clear();
     g_ghosted = false;
 
@@ -3756,7 +3833,7 @@ static void update3D(float dt) {
     // consecutive frames, outlasting ANY late Hyprland-side restore.
     if (g_fsAssertFrames > 0) {
         if (auto W = g_fsWindow.lock()) {
-            Compat::setWindowBox(W, g_fsAssertBox);
+            Compat::driveWindowBox(W, g_fsAssertBox);
 
             const auto CUR = Compat::currentWindowBox(W);
 
@@ -3794,6 +3871,65 @@ static void update3D(float dt) {
         updateRealResize();
     } else if (g_pointerGesture == EPointerGesture::WheelRoll && g_pointerDown) {
         updateWheelRoll();
+    }
+
+    // The room-box enforcer: the room and the 2D layout are separate
+    // universes. Whatever Hyprland wrote into a frozen window's box -- a
+    // tree reflow (a spawn, a float toggle), a floating recalc, a
+    // remembered-size restore on a fullscreen exit -- is reverted within
+    // this tick. A TILED window's divergence is the tree speaking: the new
+    // box is where 2D wants the window NOW, so the layout save is refreshed
+    // and the exit flight lands exactly where the settle recalc would put
+    // the window. Floating windows the room never drove stay live.
+    if (g_viewMorph == EViewMorph::None && g_fsPhase == EFullscreenPhase::None &&
+        g_fsAssertFrames == 0 && !g_roomBoxes.empty()) {
+        std::vector<std::uintptr_t> closed;
+
+        for (const auto& [ID, BOX] : g_roomBoxes) {
+            const auto W = Compat::findWindowById(ID);
+
+            if (!W) {
+                closed.push_back(ID);
+                continue;
+            }
+
+            if (ID == g_fsCurrentId || !W->m_target)
+                continue;
+
+            const bool FLOATING = W->m_target->floating();
+
+            if (FLOATING && !g_boxDriven.count(ID))
+                continue; // live box: client resizes stay visible
+
+            const auto CUR = Compat::currentWindowBox(W);
+
+            const bool diverges =
+                std::fabs(CUR.x - (BOX.x + MON->m_position.x)) > 0.5 ||
+                std::fabs(CUR.y - (BOX.y + MON->m_position.y)) > 0.5 ||
+                std::fabs(CUR.w - BOX.w) > 0.5 ||
+                std::fabs(CUR.h - BOX.h) > 0.5;
+
+            if (!diverges)
+                continue;
+
+            if (!FLOATING) {
+                for (auto& SAVE : g_layoutSaves) {
+                    if (SAVE.id != ID)
+                        continue;
+
+                    SAVE.box = CUR; // the tree's current 2D truth
+                    break;
+                }
+            }
+
+            Compat::driveWindowBox(
+                W,
+                CBox{BOX.x + MON->m_position.x, BOX.y + MON->m_position.y,
+                     BOX.w, BOX.h});
+        }
+
+        for (const auto ID : closed)
+            g_roomBoxes.erase(ID);
     }
 
     syncWorld(MON, dt);
