@@ -264,6 +264,28 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
         WINDOW->m_target->setFloating(false);
 }
 
+bool fixupGhostedWindow(const SWindowLayoutSave& save) {
+    if (save.window.expired() || !save.ghosted)
+        return false;
+
+    const auto WINDOW = save.window.lock();
+
+    if (!WINDOW || !WINDOW->m_target || WINDOW->m_target->floating())
+        return false;
+
+    if (save.space) {
+        if (const auto ALGO = save.space->algorithm())
+            ALGO->removeTarget(WINDOW->m_target);
+    }
+
+    WINDOW->m_target->setFloating(true);
+
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->damageWindow(WINDOW);
+
+    return true;
+}
+
 void restoreWindowLayoutSettle(const std::vector<SWindowLayoutSave>& saves) {
     // One recalculate per involved space: normalizes gaps/workarea over the
     // rebuilt tree.
@@ -309,6 +331,12 @@ bool driveWindowBox(const PHLWINDOW& window, const CBox& box) {
 
     window->m_target->setPositionGlobal(box);
     window->m_target->rememberFloatingSize(Vector2D{box.w, box.h});
+    // The room's box writes must land instantly: the snapshot's box comes
+    // from the window's ANIMATED geometry (getWindowMainSurfaceBox reads
+    // GEOMETRIC_CURRENT), so an animated drive makes the quad trail the
+    // gesture -- a fresh window's vars even carry the slow open-animation
+    // config. Same trick the compositor's own drag controller uses.
+    window->m_target->warpPositionSize();
 
     if (g_pHyprRenderer)
         g_pHyprRenderer->damageWindow(window);
@@ -341,6 +369,7 @@ bool setWindowBox(const PHLWINDOW& window, const CBox& box) {
     window->m_target->setFloating(true);
     window->m_target->setPositionGlobal(box);
     window->m_target->rememberFloatingSize(Vector2D{box.w, box.h});
+    window->m_target->warpPositionSize(); // instant landing, see driveWindowBox
 
     if (g_pHyprRenderer)
         g_pHyprRenderer->damageWindow(window);

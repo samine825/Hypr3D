@@ -80,6 +80,15 @@ void              restoreWindowLayout(SWindowLayoutSave& save);
 // the saved arrangement instead of following the mouse.
 void              restoreWindowLayoutSettle(const std::vector<SWindowLayoutSave>& saves);
 
+// A float/tile toggle aimed at a GHOSTED window (the keybind hits the
+// focused window, and ghosts can be aimed): Hyprland's
+// toggleTargetFloating unconditionally inserts the target into the layout
+// algorithm -- for a ghost that is an INVISIBLE node holding tree space
+// (the empty tile that slowly eats the 2D layout). Eject it from the
+// algorithm and restore the floating-panel state every ghost carries.
+// Returns true when a fixup was applied.
+bool              fixupGhostedWindow(const SWindowLayoutSave& save);
+
 CBox currentWindowBox(const PHLWINDOW& window);
 bool setWindowBox(const PHLWINDOW& window, const CBox& box);
 

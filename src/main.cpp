@@ -998,6 +998,13 @@ static uint64_t g_diagWarpCalls   = 0;
 static Vector2D g_diagWarpAfter{};
 static Vector2D g_diagMgrPos{};
 
+// Real-resize drive tracking: whether updateRealResize actually drove the
+// box, and what it drove. A stalled counter with the gesture active means
+// the gesture path never reaches the drive; a counter that grows with a
+// pinned box means the client's min/max clamps eat the resize.
+static uint64_t g_diagResizeDrives  = 0;
+static CBox     g_diagLastResizeBox{};
+
 // How far (logical px) the cursor may stray from the crosshair before it is
 // warped back. Declared with the other diagnostics so the dump and the code
 // that uses it cannot drift apart.
@@ -1183,15 +1190,29 @@ static void ghostWindows(
                 info.window,
                 CBox{CX, CY, kSpawnWidth, kSpawnHeight}
             );
+
+            // The ghost is room-driven: the enforcer holds its spawn box,
+            // and the ghost-toggle fixup (update3D) can find it in the
+            // driven set.
+            g_roomBoxes[info.id] =
+                CBox{CX - mon->m_position.x, CY - mon->m_position.y,
+                     kSpawnWidth, kSpawnHeight};
+            g_boxDriven.insert(info.id);
         }
 
         auto SAVE = Compat::saveWindowLayout(info.window);
 
         if (!SAVE.window)
-            continue;
+            continue; // transient: retried on the next tick
 
         Compat::applyWindowGhost(SAVE);
         g_layoutSaves.push_back(std::move(SAVE));
+
+        // Mark processed: without this the branch re-runs EVERY tick --
+        // setWindowBox(spawn) reverts the box the user is resizing, the
+        // room-box seed reverts with it, and g_layoutSaves grows by a
+        // duplicate save per tick for the whole session.
+        g_sessionWindows.insert(info.id);
     }
 }
 
@@ -1294,7 +1315,21 @@ static void refreshCaptures(
     const auto FOCUSED = Compat::focusedWindow();
     const std::uintptr_t FOCUSED_ID = FOCUSED ? Compat::windowId(FOCUSED) : 0;
 
+    // During the view morph every driven window's real box changes each
+    // frame, defeating the unchanged-box skip inside makeSnapshot: each
+    // retake is a full fake render into a monitor-sized framebuffer -- the
+    // transition FPS crater with several windows in flight. Cap the retakes
+    // per pass and rotate the budget so every window eventually refreshes.
+    // Quad sizes follow the snapshots, so they step instead of gliding --
+    // invisible at flight speed, and the first ungated pass after the morph
+    // lands the exact final boxes.
+    static size_t    morphCaptureCursor = 0;
+    constexpr size_t MORPH_RETAKE_BUDGET = 2;
+    const bool       MORPHING = g_viewMorph != EViewMorph::None;
+
     bool consumedSkirt = false;
+
+    size_t index = 0;
 
     for (const auto& info : infos) {
         // Focus-change feedback (the active/inactive opacity fade and the
@@ -1343,30 +1378,49 @@ static void refreshCaptures(
         // aim, focus) would retake EVERY window at full rate for the whole
         // transition -- the FPS crater. A mid-fade snapshot would bake
         // partial alpha anyway; keeping the last good one is better.
-        const bool MORPHING = g_viewMorph != EViewMorph::None;
-
         const bool FORCE = !MORPHING &&
             (FADING ||
             ALPHA_GRACE ||
             info.id == g_lastAimedId ||
             (g_world.dragActive() && g_world.draggedId() == info.id) ||
+            (g_pointerGesture == EPointerGesture::ResizeReal && g_pointerDown &&
+             g_resize.id == info.id) || // the resized window: a retake every
+                                        // frame, the quad must track the box
             info.id == FOCUSED_ID);
-
-        bool consumedSkirt = false;
 
         // The frame after a resize gesture ended: one forced snapshot, whose
         // only purpose is the settled full-resolution silhouette refresh.
+        // Sets the loop-scoped flag -- an inner shadow here would leave
+        // g_skirtFinalRefreshId set forever (a forced retake every pass).
         bool finalSkirt = false;
         if (info.id == g_skirtFinalRefreshId) {
             finalSkirt = true;
             consumedSkirt = true;
         }
 
+        // Morph retake budget: a window already holding a snapshot waits for
+        // its rotation slot; fresh captures and layers are always served.
+        if (MORPHING && !FORCE && !finalSkirt && !info.isLayer &&
+            g_capture.has(info.id)) {
+            const size_t SLOT =
+                (index + morphCaptureCursor) % infos.size();
+
+            if (SLOT >= MORPH_RETAKE_BUDGET) {
+                ++index;
+                continue;
+            }
+        }
+
         if (info.isLayer)
             g_capture.makeSnapshotLayer(info.layer, mon, FORCE || finalSkirt);
         else
             g_capture.makeSnapshot(info.window, mon, FORCE || finalSkirt);
+
+        ++index;
     }
+
+    morphCaptureCursor =
+        (morphCaptureCursor + 1) % std::max(infos.size(), size_t{1});
 
     if (consumedSkirt)
         g_skirtFinalRefreshId = 0;
@@ -2577,8 +2631,7 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
         // below reaches the snapshot one capture later -- the same one-frame
         // lag the fullscreen transition lives with.
         const auto* SNAPSHOT = g_capture.get(RW.id);
-        const CBox  BOX =
-            SNAPSHOT ? SNAPSHOT->sampledBox : MW.boxRoom;
+        CBox BOX = SNAPSHOT ? SNAPSHOT->sampledBox : MW.boxRoom;
 
         if (MW.animBox) {
             if (auto W = Compat::findWindowById(RW.id)) {
@@ -2588,6 +2641,16 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
                     W,
                     CBox{TARGET.x + mon->m_position.x,
                          TARGET.y + mon->m_position.y, TARGET.w, TARGET.h});
+
+                // The quad follows the MORPH's own box path, not the
+                // snapshot's: the capture budget refreshes snapshots in
+                // rotation, and a snapshot-driven quad would step every few
+                // frames -- the jerky transition. The UV still maps the
+                // snapshot's region, so the content runs a few frames
+                // behind the box mid-flight; at flight speed that reads as
+                // a smooth stretch, and the first ungated pass after the
+                // morph lands the exact sizes.
+                BOX = TARGET;
 
                 g_boxDriven.insert(RW.id);
             }
@@ -2826,6 +2889,9 @@ static void updateRealResize() {
     g_roomBoxes[g_resize.id] =
         CBox{BOX.x - MON->m_position.x, BOX.y - MON->m_position.y, BOX.w,
              BOX.h};
+
+    ++g_diagResizeDrives;
+    g_diagLastResizeBox = BOX;
 }
 
 static void resetPointerGesture() {
@@ -3174,28 +3240,37 @@ static void enter3D() {
     // force-floated and ghosted, so the saved tree is not disturbed by the
     // shrink, and the exit restores it as a floating panel (the FS exit
     // path asserts that size).
-    if (const auto MON = targetMonitor()) {
-        if (const auto FSW =
-                Fullscreen::controller()->getFullscreenWindow(MON)) {
-            Compat::setWindowBox(
-                FSW,
-                CBox{MON->m_position.x + MON->m_size.x * 0.5 -
-                         kSpawnWidth * 0.5,
-                     MON->m_position.y + MON->m_size.y * 0.5 -
-                         kSpawnHeight * 0.5,
-                     kSpawnWidth, kSpawnHeight});
+        if (const auto MON = targetMonitor()) {
+            if (const auto FSW =
+                    Fullscreen::controller()->getFullscreenWindow(MON)) {
+                const double PX =
+                    MON->m_size.x * 0.5 - kSpawnWidth * 0.5;
+                const double PY =
+                    MON->m_size.y * 0.5 - kSpawnHeight * 0.5;
 
-            g_layoutSaves.clear(); // no stale saves may survive into this session
+                Compat::setWindowBox(
+                    FSW,
+                    CBox{MON->m_position.x + PX, MON->m_position.y + PY,
+                         kSpawnWidth, kSpawnHeight});
 
-            auto SAVE = Compat::saveWindowLayout(FSW);
+                // Room-driven ghost, same as the session newcomers: the
+                // enforcer holds the spawn box, the ghost-toggle fixup
+                // guards the floating flag.
+                g_roomBoxes[Compat::windowId(FSW)] =
+                    CBox{PX, PY, kSpawnWidth, kSpawnHeight};
+                g_boxDriven.insert(Compat::windowId(FSW));
 
-            if (SAVE.window) {
-                Compat::applyWindowGhost(SAVE);
-                g_layoutSaves.push_back(std::move(SAVE));
+                g_layoutSaves.clear(); // no stale saves may survive into this session
+
+                auto SAVE = Compat::saveWindowLayout(FSW);
+
+                if (SAVE.window) {
+                    Compat::applyWindowGhost(SAVE);
+                    g_layoutSaves.push_back(std::move(SAVE));
+                }
+
+                g_fsLastFSWindow = FSW;
             }
-
-            g_fsLastFSWindow = FSW;
-        }
 
         g_fsWasOn =
             Fullscreen::controller()->getFullscreenWindow(MON) != nullptr;
@@ -3882,54 +3957,67 @@ static void update3D(float dt) {
     // and the exit flight lands exactly where the settle recalc would put
     // the window. Floating windows the room never drove stay live.
     if (g_viewMorph == EViewMorph::None && g_fsPhase == EFullscreenPhase::None &&
-        g_fsAssertFrames == 0 && !g_roomBoxes.empty()) {
-        std::vector<std::uintptr_t> closed;
-
-        for (const auto& [ID, BOX] : g_roomBoxes) {
-            const auto W = Compat::findWindowById(ID);
-
-            if (!W) {
-                closed.push_back(ID);
-                continue;
-            }
-
-            if (ID == g_fsCurrentId || !W->m_target)
-                continue;
-
-            const bool FLOATING = W->m_target->floating();
-
-            if (FLOATING && !g_boxDriven.count(ID))
-                continue; // live box: client resizes stay visible
-
-            const auto CUR = Compat::currentWindowBox(W);
-
-            const bool diverges =
-                std::fabs(CUR.x - (BOX.x + MON->m_position.x)) > 0.5 ||
-                std::fabs(CUR.y - (BOX.y + MON->m_position.y)) > 0.5 ||
-                std::fabs(CUR.w - BOX.w) > 0.5 ||
-                std::fabs(CUR.h - BOX.h) > 0.5;
-
-            if (!diverges)
-                continue;
-
-            if (!FLOATING) {
-                for (auto& SAVE : g_layoutSaves) {
-                    if (SAVE.id != ID)
-                        continue;
-
-                    SAVE.box = CUR; // the tree's current 2D truth
-                    break;
-                }
-            }
-
-            Compat::driveWindowBox(
-                W,
-                CBox{BOX.x + MON->m_position.x, BOX.y + MON->m_position.y,
-                     BOX.w, BOX.h});
+        g_fsAssertFrames == 0) {
+        // A float/tile toggle aimed at a GHOSTED window (the keybind hits
+        // the focused window, and ghosts can be aimed): Hyprland's
+        // toggleTargetFloating unconditionally inserts the target into the
+        // algorithm -- for a ghost that is an INVISIBLE node holding tree
+        // space: the empty tile that slowly eats the 2D layout. Eject it
+        // and restore the floating-panel state every ghost carries.
+        if (!g_layoutSaves.empty()) {
+            for (const auto& SAVE : g_layoutSaves)
+                Compat::fixupGhostedWindow(SAVE);
         }
 
-        for (const auto ID : closed)
-            g_roomBoxes.erase(ID);
+        if (!g_roomBoxes.empty()) {
+            std::vector<std::uintptr_t> closed;
+
+            for (const auto& [ID, BOX] : g_roomBoxes) {
+                const auto W = Compat::findWindowById(ID);
+
+                if (!W) {
+                    closed.push_back(ID);
+                    continue;
+                }
+
+                if (ID == g_fsCurrentId || !W->m_target)
+                    continue;
+
+                const bool FLOATING = W->m_target->floating();
+
+                if (FLOATING && !g_boxDriven.count(ID))
+                    continue; // live box: client resizes stay visible
+
+                const auto CUR = Compat::currentWindowBox(W);
+
+                const bool diverges =
+                    std::fabs(CUR.x - (BOX.x + MON->m_position.x)) > 0.5 ||
+                    std::fabs(CUR.y - (BOX.y + MON->m_position.y)) > 0.5 ||
+                    std::fabs(CUR.w - BOX.w) > 0.5 ||
+                    std::fabs(CUR.h - BOX.h) > 0.5;
+
+                if (!diverges)
+                    continue;
+
+                if (!FLOATING) {
+                    for (auto& SAVE : g_layoutSaves) {
+                        if (SAVE.id != ID)
+                            continue;
+
+                        SAVE.box = CUR; // the tree's current 2D truth
+                        break;
+                    }
+                }
+
+                Compat::driveWindowBox(
+                    W,
+                    CBox{BOX.x + MON->m_position.x, BOX.y + MON->m_position.y,
+                         BOX.w, BOX.h});
+            }
+
+            for (const auto ID : closed)
+                g_roomBoxes.erase(ID);
+        }
     }
 
     syncWorld(MON, dt);
@@ -4175,6 +4263,60 @@ static void dumpStatus() {
     // and Pointer::mgr()'s position are different quantities and only one of
     // them can be used to derive a delta.
     out << "mgrPos=" << g_diagMgrPos.x << "," << g_diagMgrPos.y << "\n";
+
+    // Real-resize state: the driven goal vs the enforcer's room box vs the
+    // snapshot box. The snapshot box feeding the quad while the drive holds
+    // a different box (or the reverse) is the resize-desync signature.
+    if (g_resize.active && g_resize.window) {
+        const auto  CUR    = Compat::currentWindowBox(g_resize.window);
+        const auto* ENTY   = g_world.find(g_resize.id);
+        const auto* SNAP   = g_capture.get(g_resize.id);
+        const auto  ROOMIT = g_roomBoxes.find(g_resize.id);
+
+        out << "resizeWin=" << g_resize.id
+            << " goal=" << CUR.x << "," << CUR.y << "," << CUR.w << ","
+            << CUR.h;
+
+        // The animated content box (what the snapshot actually renders at)
+        // vs the driven goal: a persistent gap means the warp is not
+        // landing or something keeps re-animating the window.
+        if (g_resize.window) {
+            const auto SURF = g_resize.window->getWindowMainSurfaceBox();
+
+            out << " surf=" << SURF.x << "," << SURF.y << "," << SURF.w
+                << "," << SURF.h << " reported="
+                << g_resize.window->m_reportedSize.x << ","
+                << g_resize.window->m_reportedSize.y;
+        }
+
+        if (ROOMIT != g_roomBoxes.end())
+            out << " roomBox=" << ROOMIT->second.x << ","
+                << ROOMIT->second.y << "," << ROOMIT->second.w << ","
+                << ROOMIT->second.h;
+
+        if (SNAP)
+            out << " snapBox=" << SNAP->sampledBox.x << ","
+                << SNAP->sampledBox.y << "," << SNAP->sampledBox.w << ","
+                << SNAP->sampledBox.h << " texSpan=" << SNAP->texSpan.x
+                << "," << SNAP->texSpan.y
+                << " bigTex=" << (SNAP->bigTex ? 1 : 0);
+
+        if (ENTY)
+            out << " quadW=" << ENTY->width << " quadH=" << ENTY->height;
+
+        const auto MINR = g_resize.window->minSize().value_or(Vector2D{1, 1});
+        const auto MAXR = g_resize.window->maxSize().value_or(
+            Vector2D{INFINITY, INFINITY});
+
+        out << " drives=" << g_diagResizeDrives << " lastDrive="
+            << g_diagLastResizeBox.x << "," << g_diagLastResizeBox.y << ","
+            << g_diagLastResizeBox.w << "," << g_diagLastResizeBox.h
+            << " min=" << MINR.x << "x" << MINR.y << " max=" << MAXR.x << "x"
+            << MAXR.y;
+
+        out << " grab=" << g_resize.grabPx.x << "," << g_resize.grabPx.y
+            << " edges=" << g_resize.edgeX << "," << g_resize.edgeY << "\n";
+    }
 
     const Vector2D CENTER = crosshairLogical();
 
