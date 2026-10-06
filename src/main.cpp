@@ -390,6 +390,14 @@ static constexpr auto kFramePumpInterval = std::chrono::milliseconds(8);
 // windows (Super+LMB), resizes (Super+RMB) and clicks through to clients.
 enum class EKeyboardMode : uint8_t { Space, Window };
 static EKeyboardMode g_keyboardMode = EKeyboardMode::Space;
+
+// input.typing_cursor: window (typing) mode also frees the pointer and gives
+// it a cursor on the windows. Off, window mode only redirects the keyboard
+// and the mouse keeps steering the camera.
+static bool     g_cfgTypingCursor = false;
+// input.typing_button: a mouse button (evdev code) that toggles window mode,
+// 0 = none.
+static uint32_t g_cfgTypingButton = 0;
 static bool          g_altHeld      = false;
 
 // The free cursor was last seen over the room (see onMouseMove).
@@ -1126,7 +1134,7 @@ static void requestDeactivate3D();
 // comes back and can leave for the other monitors. Space mode captures it
 // again behind the crosshair.
 static bool pointerFree() {
-    return g_keyboardMode == EKeyboardMode::Window;
+    return g_cfgTypingCursor && g_keyboardMode == EKeyboardMode::Window;
 }
 
 // Typing-mode virtual cursor state; see the block above onRenderStage.
@@ -5228,10 +5236,13 @@ static void setKeyboardMode(EKeyboardMode mode) {
     g_scene.setCrosshairVisible(!pointerFree());
 
     notify(
-        !pointerFree() ? "[hypr3d] moving: wasd / space / shift / ctrl" :
+        g_keyboardMode == EKeyboardMode::Space ?
+            "[hypr3d] keyboard: space (wasd / space / shift / ctrl)" :
+        !pointerFree() ?
+            "[hypr3d] keyboard: window (typing reaches the focused window)" :
         virtualCursor() ?
-            "[hypr3d] typing: cursor on the windows (back button to return)" :
-            "[hypr3d] typing: free cursor (back button / click the room to return)",
+            "[hypr3d] typing: cursor on the windows (toggle again to return)" :
+            "[hypr3d] typing: free cursor (toggle again / click the room to return)",
         CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
     );
 
@@ -5512,12 +5523,13 @@ static void onMouseButton(
         return;
     }
 
-    // The back (thumb) button switches between moving and typing.
-    if (event.button == BTN_BACK) {
+    // input.typing_button switches between moving and typing.
+    if (g_cfgTypingButton && event.button == g_cfgTypingButton) {
         if (PRESSED) {
-            setKeyboardMode(pointerFree() ? EKeyboardMode::Space :
-                                            EKeyboardMode::Window);
-            g_swallowRelease = BTN_BACK;
+            setKeyboardMode(g_keyboardMode == EKeyboardMode::Window ?
+                                EKeyboardMode::Space :
+                                EKeyboardMode::Window);
+            g_swallowRelease = event.button;
         }
 
         info.cancelled = true;
@@ -6246,6 +6258,48 @@ static int luaConfig(lua_State* L) {
         // anything below is clamped up to it.
         g_cfgWindowDepth = std::max(0.0f, g_cfgWindowDepth);
 
+        lua_pop(L, 1);
+    }
+
+    // input = { typing_cursor = bool, typing_button = "back" | code }
+    idx = SECTION("input", "input");
+    if (idx == -1)
+        return luaL_error(L, "hypr3d.config: input must be a table");
+    if (idx > 0) {
+        bool cursor = g_cfgTypingCursor;
+        if (!SET_BOOL(idx, "typing_cursor", cursor, "input.typing_cursor"))
+            return luaL_error(L, "hypr3d.config: input.typing_cursor must be a boolean");
+        // Leaving typing mode with the cursor off would strand a freed pointer.
+        if (!cursor && g_cfgTypingCursor && g_keyboardMode == EKeyboardMode::Window)
+            setKeyboardMode(EKeyboardMode::Space);
+        g_cfgTypingCursor = cursor;
+
+        lua_getfield(L, idx, "typing_button");
+        if (lua_type(L, -1) == LUA_TNUMBER)
+            g_cfgTypingButton = static_cast<uint32_t>(lua_tointeger(L, -1));
+        else if (lua_type(L, -1) == LUA_TSTRING) {
+            const std::string NAME = lua_tostring(L, -1);
+            static const std::pair<const char*, uint32_t> NAMES[] = {
+                {"", 0},
+                {"side", BTN_SIDE},       {"extra", BTN_EXTRA},
+                {"forward", BTN_FORWARD}, {"back", BTN_BACK},
+                {"task", BTN_TASK},
+            };
+            bool found = false;
+            for (const auto& [N, CODE] : NAMES)
+                if (NAME == N) {
+                    g_cfgTypingButton = CODE;
+                    found = true;
+                }
+            if (!found) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: input.typing_button must be side, extra, forward, back, task or a button code");
+            }
+        } else if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: input.typing_button must be a name or a button code");
+        }
+        lua_pop(L, 1);
         lua_pop(L, 1);
     }
 
