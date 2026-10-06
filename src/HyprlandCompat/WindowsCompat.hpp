@@ -36,7 +36,11 @@ struct SWindowInfo {
 // Enumerate mapped, non-hidden windows that live on a visible workspace of
 // `monitor`. Windows on invisible workspaces are skipped (the snapshot path
 // refuses to render them anyway).
-std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor);
+// `underLayers` (world.under_layers): the room is drawn under the top and
+// overlay layers, so only bottom-layer surfaces join it; otherwise every
+// layer above the background does.
+std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
+                                                  bool underLayers = false);
 
 // True if the window still belongs to the eligible set (mapped, not hidden).
 bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor);

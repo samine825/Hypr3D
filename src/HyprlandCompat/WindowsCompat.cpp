@@ -36,7 +36,8 @@ static bool onRoomWorkspace(const PHLWINDOW& window, const PHLMONITOR& monitor) 
         (WORKSPACE && WORKSPACE == monitor->m_activeSpecialWorkspace);
 }
 
-std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
+std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
+                                                  bool underLayers) {
     std::vector<SWindowInfo> out;
 
     if (!monitor || !Desktop::windowState())
@@ -126,17 +127,20 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor) {
     // Bottom-layer surfaces (desktop widgets) live outside the window list
     // and sit under the room, so they join it as regular entities. The
     // background layer is skipped -- that is where wallpapers live, and a
-    // full-screen wallpaper would swallow the whole room. Top and overlay
-    // layers (bars, launchers, notifications) are drawn by Hyprland over the
-    // room and stay ordinary 2D surfaces. Their boxes are monitor-local and
-    // decoration-free.
-    constexpr uint32_t LAYER_BOTTOM = 1;
+    // full-screen wallpaper would swallow the whole room. With the room
+    // under the layers (underLayers), top and overlay layers (bars,
+    // launchers, notifications) are drawn by Hyprland over it and stay
+    // ordinary 2D surfaces, so only the bottom layer (desktop widgets)
+    // joins. Their boxes are monitor-local and decoration-free.
+    constexpr uint32_t LAYER_BACKGROUND = 0;
+    constexpr uint32_t LAYER_BOTTOM     = 1;
 
     for (const auto& LAYERLIST : monitor->m_layerSurfaceLayers) {
         for (const auto& LSREF : LAYERLIST) {
             const auto LS = LSREF.lock();
 
-            if (!LS || !LS->visible() || LS->m_layer != LAYER_BOTTOM)
+            if (!LS || !LS->visible() || LS->m_layer == LAYER_BACKGROUND ||
+                (underLayers && LS->m_layer != LAYER_BOTTOM))
                 continue;
 
             const auto BOXOPT = LS->surfaceLogicalBox();
