@@ -8,12 +8,15 @@
 #include "World/MapCollision.hpp"
 
 #include <hyprgraphics/image/Image.hpp>
+
+#include "../../third_party/stb_image.h"
 #include <hyprutils/memory/SharedPtr.hpp>
 
 #include <algorithm>
 #include <cmath>
 #include <filesystem>
 #include <memory>
+#include <span>
 #include <string_view>
 
 namespace H3D {
@@ -191,30 +194,78 @@ Vec3 transformPoint(const Mat4& m, const Vec3& p) {
 
 } // namespace
 
-// --- textures ---------------------------------------------------------------
+// --- decoding (worker thread) -------------------------------------------------
 
-unsigned int CMapModel::uploadTexture(const std::string& modelDir,
-                                      const void* imagePtr,
-                                      bool embedded, const void* data, size_t size) {
-    auto* image = static_cast<const cgltf_image*>(imagePtr);
+// Everything a load reads and decodes, without a GL object: it is built on a
+// worker thread. Inside the render pass the same work froze Hyprland for
+// 437 ms on a 47 MB model (Khronos' FlightHelmet, measured with perf).
+struct CMapModel::SDecoded {
+    struct SImage {
+        int                        w = 0, h = 0;
+        std::vector<unsigned char> rgba; // empty: unused or undecodable
+    };
 
+    struct SPrim {
+        SPrimitive            params;             // GL ids are still 0
+        int                   baseImage     = -1; // index into images
+        int                   emissiveImage = -1;
+        std::vector<float>    verts;
+        std::vector<uint32_t> indices;
+    };
+
+    std::vector<SImage> images; // by glTF image index
+    std::vector<SPrim>  prims;
+    std::vector<STL>    localTriangles;
+};
+
+namespace {
+
+// One glTF image as RGBA rows, the top row first. Leaves rgba empty when the
+// image cannot be read.
+void decodeImage(const std::string& modelDir, const cgltf_image* image, int& w,
+                 int& h, std::vector<unsigned char>& rgba) {
     std::unique_ptr<Hyprgraphics::CImage> img;
 
-    if (embedded) {
+    const uint8_t* embedded = nullptr;
+    size_t         embeddedSize = 0;
+
+    if (image->buffer_view) {
+        const auto* BV   = image->buffer_view;
+        const auto* BASE = static_cast<const uint8_t*>(cgltf_buffer_view_data(BV));
+        if (!BASE)
+            return;
+        embedded     = BASE;
+        embeddedSize = BV->size;
         img = std::make_unique<Hyprgraphics::CImage>(
-            std::span<const uint8_t>{static_cast<const uint8_t*>(data), size},
-            Hyprgraphics::IMAGE_FORMAT_AUTO);
-    } else if (image && image->uri &&
-               !std::string_view{image->uri}.starts_with("data:")) {
+            std::span<const uint8_t>{BASE, BV->size}, Hyprgraphics::IMAGE_FORMAT_AUTO);
+    } else if (image->uri && !std::string_view{image->uri}.starts_with("data:")) {
         img = std::make_unique<Hyprgraphics::CImage>(modelDir + "/" + image->uri);
     } else {
-        return 0; // data URIs are rare in maps; skip rather than fail
+        return; // data URIs are rare in maps; skip rather than fail
     }
 
     auto surface = (img && img->success()) ? img->cairoSurface() : nullptr;
 
-    if (!surface || surface->status() != CAIRO_STATUS_SUCCESS)
-        return 0;
+    if (!surface || surface->status() != CAIRO_STATUS_SUCCESS) {
+        // hyprgraphics decodes only PNG, AVIF and SVG from memory, and a .glb
+        // embeds other formats as often (all five images of Khronos'
+        // DamagedHelmet.glb are image/jpeg). A failed embedded image falls
+        // back to the vendored stb_image -- the same decoder PlayerModel.cpp
+        // implements -- which auto-detects JPEG, PNG, BMP, TGA, GIF, PSD, HDR,
+        // PIC and PNM from bytes. stb's rows are top-first RGBA with straight
+        // alpha, exactly what the cairo conversion below produces.
+        if (embedded) {
+            int W = 0, H = 0, COMP = 0;
+            if (auto* PX = stbi_load_from_memory(
+                    embedded, static_cast<int>(embeddedSize), &W, &H, &COMP, 4)) {
+                rgba.assign(PX, PX + static_cast<size_t>(W) * H * 4);
+                stbi_image_free(PX);
+                w = W;
+                h = H;
+            }
+        }
+        return;
+    }
 
     const int W      = static_cast<int>(surface->size().x);
     const int H      = static_cast<int>(surface->size().y);
@@ -222,17 +273,17 @@ unsigned int CMapModel::uploadTexture(const std::string& modelDir,
     const auto* SRC  = surface->data();
 
     if (W <= 0 || H <= 0 || !SRC)
-        return 0;
+        return;
 
     // Cairo ARGB32 is premultiplied BGRA; textures want RGBA. NO row flip:
     // glTF's UV origin is the image TOP-LEFT with v growing down, and GL's
     // v = 0 samples the first uploaded row -- so cairo row 0 (the top) must
     // land in the first texel row. Flipping here mirrors every texture.
-    std::vector<unsigned char> pixels(static_cast<size_t>(W) * H * 4);
+    rgba.resize(static_cast<size_t>(W) * H * 4);
 
     for (int y = 0; y < H; ++y) {
         const auto* row = SRC + static_cast<size_t>(y) * STRIDE;
-        auto*       dst = pixels.data() + static_cast<size_t>(y) * W * 4;
+        auto*       dst = rgba.data() + static_cast<size_t>(y) * W * 4;
 
         for (int x = 0; x < W; ++x) {
             dst[x * 4 + 0] = row[x * 4 + 2];
@@ -242,88 +293,54 @@ unsigned int CMapModel::uploadTexture(const std::string& modelDir,
         }
     }
 
-    unsigned int tex = 0;
-    glGenTextures(1, &tex);
-
-    glBindTexture(GL_TEXTURE_2D, tex);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
-
-    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, W, H, 0, GL_RGBA, GL_UNSIGNED_BYTE,
-                 pixels.data());
-    glGenerateMipmap(GL_TEXTURE_2D);
-    glBindTexture(GL_TEXTURE_2D, 0);
-
-    return tex;
+    w = W;
+    h = H;
 }
 
-// --- load / destroy ---------------------------------------------------------
+} // namespace
 
-bool CMapModel::load(const std::string& path, const Vec3& position,
-                     const Vec3& rotationDeg, const Vec3& scale) {
-    destroy();
-
-    setTransform(position, rotationDeg, scale);
-    m_path = path;
-
+std::unique_ptr<CMapModel::SDecoded>
+CMapModel::decode(const std::string& path, std::stop_token stop) {
     cgltf_options options{};
-    cgltf_data*   data = nullptr;
+    cgltf_data*   raw = nullptr;
 
-    if (cgltf_parse_file(&options, path.c_str(), &data) != cgltf_result_success)
-        return false;
+    if (cgltf_parse_file(&options, path.c_str(), &raw) != cgltf_result_success)
+        return nullptr;
+
+    const std::unique_ptr<cgltf_data, decltype(&cgltf_free)> data{raw, cgltf_free};
 
     // Relative .bin / image URIs resolve against the model file's directory
     // only when the model file's own path is passed here.
-    if (cgltf_load_buffers(&options, data, path.c_str()) != cgltf_result_success) {
-        cgltf_free(data);
-        return false;
-    }
+    if (cgltf_load_buffers(&options, data.get(), path.c_str()) != cgltf_result_success)
+        return nullptr;
 
-    if (cgltf_validate(data) != cgltf_result_success) {
-        cgltf_free(data);
-        return false;
-    }
+    if (cgltf_validate(data.get()) != cgltf_result_success)
+        return nullptr;
 
-    {
-        const GLuint VS = compileMapShader(GL_VERTEX_SHADER, MAP_VERTEX);
-        const GLuint FS = compileMapShader(GL_FRAGMENT_SHADER, MAP_FRAGMENT);
-
-        if (VS && FS) {
-            const GLuint P = glCreateProgram();
-            glAttachShader(P, VS);
-            glAttachShader(P, FS);
-            glLinkProgram(P);
-
-            GLint ok = GL_FALSE;
-            glGetProgramiv(P, GL_LINK_STATUS, &ok);
-            if (ok == GL_TRUE) {
-                m_program = P;
-                m_uMVP    = glGetUniformLocation(P, "uMVP");
-                m_uModel  = glGetUniformLocation(P, "uModel");
-                m_uColor  = glGetUniformLocation(P, "uColor");
-                m_uTex    = glGetUniformLocation(P, "uTex");
-                m_uEmissive         = glGetUniformLocation(P, "uEmissive");
-                m_uHasEmissive      = glGetUniformLocation(P, "uHasEmissive");
-                m_uEmissiveFactor   = glGetUniformLocation(P, "uEmissiveFactor");
-                m_uEmissiveStrength = glGetUniformLocation(P, "uEmissiveStrength");
-                m_uFlat             = glGetUniformLocation(P, "uFlat");
-                m_uAlphaMode        = glGetUniformLocation(P, "uAlphaMode");
-                m_uAlphaCutoff      = glGetUniformLocation(P, "uAlphaCutoff");
-            }
-        }
-
-        if (VS)
-            glDeleteShader(VS);
-        if (FS)
-            glDeleteShader(FS);
-    }
+    auto result = std::make_unique<SDecoded>();
+    result->images.resize(data->images_count);
 
     const std::string MODEL_DIR =
         std::filesystem::path{path}.parent_path().string();
 
-    std::vector<unsigned int> imageTextures(data->images_count, 0);
+    // The image behind a texture slot, decoded the first time it is used.
+    std::vector<bool> tried(data->images_count, false);
+    const auto IMAGE = [&](const cgltf_texture_view& view) {
+        if (!view.texture || !view.texture->image)
+            return -1;
+
+        const auto IDX = static_cast<size_t>(view.texture->image - data->images);
+        if (IDX >= result->images.size())
+            return -1;
+
+        if (!tried[IDX]) {
+            tried[IDX] = true;
+            auto& IMG  = result->images[IDX];
+            decodeImage(MODEL_DIR, view.texture->image, IMG.w, IMG.h, IMG.rgba);
+        }
+
+        return result->images[IDX].rgba.empty() ? -1 : static_cast<int>(IDX);
+    };
 
     // Depth-first over the scene graph so nested meshes keep their world
     // placement.
@@ -333,6 +350,10 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             stack.push_back(data->scene->nodes[i]);
 
     while (!stack.empty()) {
+        // A newer load or the plugin's exit waits for this thread.
+        if (stop.stop_requested())
+            return nullptr;
+
         const cgltf_node* node = stack.back();
         stack.pop_back();
 
@@ -371,7 +392,8 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             if (!POS || POS->count == 0)
                 continue;
 
-            SPrimitive out{};
+            SDecoded::SPrim out_{};
+            SPrimitive&     out = out_.params;
 
             if (prim->material) {
                 // glTF alpha pipeline.
@@ -410,67 +432,9 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                                 .emissive_strength) :
                         1.0f;
 
-                // KHR_materials_pbrSpecularGlossiness keeps the colour in its
-                // diffuse texture; the metallic-roughness base is empty there.
-                const auto& BASE_TEX = SPEC_GLOSS ? SG.diffuse_texture
-                                                  : PBR.base_color_texture;
-
-                if (BASE_TEX.texture && BASE_TEX.texture->image) {
-                    const auto* IMG = BASE_TEX.texture->image;
-                    const auto  IDX = static_cast<size_t>(IMG - data->images);
-
-                    if (IDX < imageTextures.size()) {
-                        if (imageTextures[IDX] != 0) {
-                            out.texture = imageTextures[IDX];
-                        } else {
-                            std::vector<uint8_t> bytes;
-                            bool                 embedded = false;
-
-                            if (IMG->buffer_view) {
-                                const auto* BV   = IMG->buffer_view;
-                                const auto* BASE = cgltf_buffer_view_data(BV);
-                                if (BASE) {
-                                    bytes.assign(BASE, BASE + BV->size);
-                                    embedded = true;
-                                }
-                            }
-
-                            out.texture = uploadTexture(MODEL_DIR, IMG, embedded,
-                                                        bytes.data(), bytes.size());
-                            imageTextures[IDX] = out.texture;
-                        }
-                    }
-                }
-
-                if (prim->material->emissive_texture.texture &&
-                    prim->material->emissive_texture.texture->image) {
-                    const auto* IMG =
-                        prim->material->emissive_texture.texture->image;
-                    const auto IDX = static_cast<size_t>(IMG - data->images);
-
-                    if (IDX < imageTextures.size()) {
-                        if (imageTextures[IDX] != 0) {
-                            out.emissiveTex = imageTextures[IDX];
-                        } else {
-                            std::vector<uint8_t> bytes;
-                            bool                 embedded = false;
-
-                            if (IMG->buffer_view) {
-                                const auto* BV   = IMG->buffer_view;
-                                const auto* BASE = cgltf_buffer_view_data(BV);
-                                if (BASE) {
-                                    bytes.assign(BASE, BASE + BV->size);
-                                    embedded = true;
-                                }
-                            }
-
-                            out.emissiveTex = uploadTexture(
-                                MODEL_DIR, IMG, embedded, bytes.data(),
-                                bytes.size());
-                            imageTextures[IDX] = out.emissiveTex;
-                        }
-                    }
-                }
+                out_.baseImage     = IMAGE(SPEC_GLOSS ? SG.diffuse_texture :
+                                                       PBR.base_color_texture);
+                out_.emissiveImage = IMAGE(prim->material->emissive_texture);
             }
 
             // Interleaved attribute stream for the GPU: pos(3) normal(3)
@@ -479,7 +443,7 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
             // bake the mesh renders in raw accessor orientation (Sketchfab
             // roots are rotated; the model shows up on its side) while the
             // collision triangles land correctly.
-            std::vector<float> verts;
+            std::vector<float>& verts = out_.verts;
             verts.reserve(static_cast<size_t>(POS->count) * 8);
 
             // Node-space AABB center for the blend pass's distance sort.
@@ -522,7 +486,7 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                 verts.push_back(cuv[1]);
             }
 
-            std::vector<uint32_t> indices;
+            std::vector<uint32_t>& indices = out_.indices;
             if (prim->indices) {
                 indices.resize(prim->indices->count);
                 for (cgltf_size i = 0; i < prim->indices->count; ++i) {
@@ -546,7 +510,7 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                     const auto V1 = indices[t + 1] * 8;
                     const auto V2 = indices[t + 2] * 8;
 
-                    m_localTriangles.push_back({
+                    result->localTriangles.push_back({
                         {verts[V0 + 0], verts[V0 + 1], verts[V0 + 2]},
                         {verts[V1 + 0], verts[V1 + 1], verts[V1 + 2]},
                         {verts[V2 + 0], verts[V2 + 1], verts[V2 + 2]},
@@ -554,64 +518,214 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                 }
             }
 
-            // GL upload.
-            glGenVertexArrays(1, &out.vao);
-            glGenBuffers(1, &out.vbo);
-            glGenBuffers(1, &out.ebo);
-
-            glBindVertexArray(out.vao);
-
-            glBindBuffer(GL_ARRAY_BUFFER, out.vbo);
-            glBufferData(GL_ARRAY_BUFFER,
-                         static_cast<GLsizeiptr>(verts.size() * sizeof(float)),
-                         verts.data(), GL_STATIC_DRAW);
-
-            glEnableVertexAttribArray(0);
-            glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
-                                  reinterpret_cast<void*>(0));
-            glEnableVertexAttribArray(1);
-            glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
-                                  reinterpret_cast<void*>(3 * sizeof(float)));
-            glEnableVertexAttribArray(2);
-            glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
-                                  reinterpret_cast<void*>(6 * sizeof(float)));
-
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, out.ebo);
-            glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-                         static_cast<GLsizeiptr>(indices.size() * sizeof(uint32_t)),
-                         indices.data(), GL_STATIC_DRAW);
-
             out.centroid = Vec3{(lo.x + hi.x) * 0.5f, (lo.y + hi.y) * 0.5f,
                                 (lo.z + hi.z) * 0.5f};
 
             out.count   = static_cast<int>(indices.size());
             out.indexed = true;
 
-            glBindVertexArray(0);
-            glBindBuffer(GL_ARRAY_BUFFER, 0);
-            glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
-
-            m_primitives.push_back(out);
+            result->prims.push_back(std::move(out_));
         }
     }
 
-    cgltf_free(data);
+    return result;
+}
 
-    // The image cache maps images -> textures; collect the unique ids so
-    // destroy() can free them (map reloads would otherwise leak every
-    // texture, base and emissive alike).
-    m_ownedTextures.clear();
-    for (const auto T : imageTextures)
-        if (T != 0 &&
-            std::find(m_ownedTextures.begin(), m_ownedTextures.end(), T) ==
-                m_ownedTextures.end())
+// --- load / upload / destroy --------------------------------------------------
+
+CMapModel::CMapModel() = default;
+
+CMapModel::~CMapModel() {
+    stopWorker();
+}
+
+void CMapModel::stopWorker() {
+    if (m_worker.joinable()) {
+        m_worker.request_stop();
+        m_worker.join();
+    }
+    m_decoded.reset();
+    m_decodedReady.store(false, std::memory_order_relaxed);
+}
+
+bool CMapModel::load(const std::string& path, const Vec3& position,
+                     const Vec3& rotationDeg, const Vec3& scale) {
+    // A load still decoding is dropped; its thread stops at the next node.
+    // One still uploading its textures is dropped as well.
+    stopWorker();
+    dropUpload();
+
+    // Another file: the old mesh goes now, as before. The same file again
+    // (written anew, e.g. from Blender): the old mesh stays until the new
+    // one is decoded, so the room does not flicker.
+    if (m_meshPath != path)
+        releaseMesh();
+
+    setTransform(position, rotationDeg, scale);
+    m_path   = path;
+    m_failed = false;
+
+    m_worker = std::jthread([this, path](std::stop_token stop) {
+        // An exception leaving this thread would terminate Hyprland.
+        try {
+            m_decoded = decode(path, stop);
+        } catch (...) {
+            m_decoded.reset();
+        }
+        m_decodedReady.store(true, std::memory_order_release);
+    });
+
+    return true;
+}
+
+void CMapModel::poll() {
+    if (!m_uploading) {
+        if (!m_worker.joinable() || !m_decodedReady.load(std::memory_order_acquire))
+            return;
+
+        m_worker.join();
+        m_decodedReady.store(false, std::memory_order_relaxed);
+
+        if (!m_decoded) {
+            m_failed = true;
+            return;
+        }
+
+        m_uploading = std::move(m_decoded);
+        m_uploadTextures.assign(m_uploading->images.size(), 0);
+        m_uploadNext = 0;
+    }
+
+    // One texture per frame: six 2048x2048 textures with their mipmaps held
+    // Hyprland ~100 ms in a single frame (VM, virgl).
+    while (m_uploadNext < m_uploading->images.size()) {
+        auto& IMG = m_uploading->images[m_uploadNext++];
+        if (IMG.rgba.empty())
+            continue;
+
+        unsigned int tex = 0;
+        glGenTextures(1, &tex);
+
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, IMG.w, IMG.h, 0, GL_RGBA,
+                     GL_UNSIGNED_BYTE, IMG.rgba.data());
+        glGenerateMipmap(GL_TEXTURE_2D);
+        glBindTexture(GL_TEXTURE_2D, 0);
+
+        m_uploadTextures[m_uploadNext - 1] = tex;
+        IMG.rgba = {}; // uploaded: the pixels can go
+        return;
+    }
+
+    finishUpload();
+}
+
+void CMapModel::finishUpload() {
+    const auto DECODED = std::move(m_uploading);
+
+    releaseMesh();
+
+    if (!m_program) {
+        const GLuint VS = compileMapShader(GL_VERTEX_SHADER, MAP_VERTEX);
+        const GLuint FS = compileMapShader(GL_FRAGMENT_SHADER, MAP_FRAGMENT);
+
+        if (VS && FS) {
+            const GLuint P = glCreateProgram();
+            glAttachShader(P, VS);
+            glAttachShader(P, FS);
+            glLinkProgram(P);
+
+            GLint ok = GL_FALSE;
+            glGetProgramiv(P, GL_LINK_STATUS, &ok);
+            if (ok == GL_TRUE) {
+                m_program = P;
+                m_uMVP    = glGetUniformLocation(P, "uMVP");
+                m_uModel  = glGetUniformLocation(P, "uModel");
+                m_uColor  = glGetUniformLocation(P, "uColor");
+                m_uTex    = glGetUniformLocation(P, "uTex");
+                m_uEmissive         = glGetUniformLocation(P, "uEmissive");
+                m_uHasEmissive      = glGetUniformLocation(P, "uHasEmissive");
+                m_uEmissiveFactor   = glGetUniformLocation(P, "uEmissiveFactor");
+                m_uEmissiveStrength = glGetUniformLocation(P, "uEmissiveStrength");
+                m_uFlat             = glGetUniformLocation(P, "uFlat");
+                m_uAlphaMode        = glGetUniformLocation(P, "uAlphaMode");
+                m_uAlphaCutoff      = glGetUniformLocation(P, "uAlphaCutoff");
+            }
+        }
+
+        if (VS)
+            glDeleteShader(VS);
+        if (FS)
+            glDeleteShader(FS);
+    }
+
+    // One texture per decoded image, shared by every primitive using it.
+    // destroy() frees them; map reloads would otherwise leak every texture,
+    // base and emissive alike.
+    const std::vector<unsigned int> TEXTURES = std::move(m_uploadTextures);
+    m_uploadTextures.clear();
+    for (const auto T : TEXTURES)
+        if (T != 0)
             m_ownedTextures.push_back(T);
 
-    m_loaded = true;
+    for (auto& P : DECODED->prims) {
+        SPrimitive out = P.params;
+        out.texture     = P.baseImage >= 0 ? TEXTURES[P.baseImage] : 0;
+        out.emissiveTex = P.emissiveImage >= 0 ? TEXTURES[P.emissiveImage] : 0;
+
+        glGenVertexArrays(1, &out.vao);
+        glGenBuffers(1, &out.vbo);
+        glGenBuffers(1, &out.ebo);
+
+        glBindVertexArray(out.vao);
+
+        glBindBuffer(GL_ARRAY_BUFFER, out.vbo);
+        glBufferData(GL_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(P.verts.size() * sizeof(float)),
+                     P.verts.data(), GL_STATIC_DRAW);
+
+        glEnableVertexAttribArray(0);
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                              reinterpret_cast<void*>(0));
+        glEnableVertexAttribArray(1);
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                              reinterpret_cast<void*>(3 * sizeof(float)));
+        glEnableVertexAttribArray(2);
+        glVertexAttribPointer(2, 2, GL_FLOAT, GL_FALSE, 8 * sizeof(float),
+                              reinterpret_cast<void*>(6 * sizeof(float)));
+
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, out.ebo);
+        glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+                     static_cast<GLsizeiptr>(P.indices.size() * sizeof(uint32_t)),
+                     P.indices.data(), GL_STATIC_DRAW);
+
+        glBindVertexArray(0);
+        glBindBuffer(GL_ARRAY_BUFFER, 0);
+        glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
+
+        m_primitives.push_back(out);
+    }
+
+    m_localTriangles = std::move(DECODED->localTriangles);
+    m_meshPath       = m_path;
+    m_loaded         = true;
     resolvePivot();
     recomputeTriangles();
     ++m_meshVersion;
-    return true;
+}
+
+void CMapModel::dropUpload() {
+    for (const auto T : m_uploadTextures)
+        if (T != 0)
+            glDeleteTextures(1, &T);
+    m_uploadTextures.clear();
+    m_uploading.reset();
+    m_uploadNext = 0;
 }
 
 float CMapModel::rayCast(const Vec3& origin, const Vec3& dir) const {
@@ -621,7 +735,7 @@ float CMapModel::rayCast(const Vec3& origin, const Vec3& dir) const {
     return CMapCollision::rayTriangles(m_triangles, origin, dir);
 }
 
-void CMapModel::destroy() {
+void CMapModel::releaseMesh() {
     if (!m_ownedTextures.empty()) {
         glDeleteTextures(static_cast<GLsizei>(m_ownedTextures.size()),
                          m_ownedTextures.data());
@@ -640,9 +754,18 @@ void CMapModel::destroy() {
 
     m_triangles.clear();
     m_localTriangles.clear();
+    m_meshPath.clear();
     m_loaded = false;
     ++m_generation;
     ++m_meshVersion;
+}
+
+void CMapModel::destroy() {
+    stopWorker();
+    dropUpload();
+    m_failed = false;
+
+    releaseMesh();
 
     glDeleteBuffers(1, &m_debugVBO);
     glDeleteVertexArrays(1, &m_debugVAO);
