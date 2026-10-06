@@ -396,7 +396,10 @@ static EKeyboardMode g_keyboardMode = EKeyboardMode::Space;
 // input.typing_cursor: window (typing) mode also frees the pointer and gives
 // it a cursor on the windows. Off, window mode only redirects the keyboard
 // and the mouse keeps steering the camera.
-static bool     g_cfgTypingCursor = false;
+// On by default: entering typing mode (Super + Left Alt) turns the crosshair
+// into one ordinary cursor over the whole screen; motion, clicks and scroll
+// under it are delivered to the window under the point.
+static bool     g_cfgTypingCursor = true;
 // input.typing_button: a mouse button (evdev code) that toggles window mode,
 // 0 = none.
 static uint32_t g_cfgTypingButton = 0;
@@ -4922,7 +4925,10 @@ static void vcEnterWindow(const World3D::SHit& hit) {
     if (!E)
         return;
 
-    g_vcSpace = ECursorSpace::Window;
+    // The cursor stays a plain screen-space arrow (g_vcSpace is Screen):
+    // one ordinary cursor over the whole screen, never a per-window one.
+    // Only the INPUT target is remembered here -- motion, clicks and scroll
+    // under the point are delivered to this window in its surface space.
     g_vcId    = hit.id;
     g_vcLocal = Vector2D{std::clamp(hit.u, 0.0f, 1.0f) * E->logicalWidth,
                          std::clamp(hit.v, 0.0f, 1.0f) * E->logicalHeight};
@@ -4995,6 +5001,17 @@ static void vcResolveScreen(const PHLMONITOR& mon) {
         return;
     }
 
+    // A held client button keeps its target: the drag follows the cursor
+    // while it stays over the window and stops at its edge when it leaves.
+    if (g_clientButtonDown) {
+        const World3D::SHit HELD = pickVisible(screenRay(mon, g_vcScreen));
+
+        if (HELD.hit && HELD.id == g_vcId)
+            vcEnterWindow(HELD); // refreshes the local + delivers motion
+
+        return;
+    }
+
     const World3D::SHit HIT = pickVisible(screenRay(mon, g_vcScreen));
 
     if (HIT.hit) {
@@ -5002,9 +5019,7 @@ static void vcResolveScreen(const PHLMONITOR& mon) {
         return;
     }
 
-    if (g_vcSpace == ECursorSpace::Window)
-        Compat::clearPointerFocus();
-
+    Compat::clearPointerFocus();
     g_vcSpace = ECursorSpace::Screen;
     g_vcId    = 0;
 }
@@ -5013,59 +5028,6 @@ static void vcMove(double dx, double dy) {
     const auto MON = targetMonitor();
     if (!MON)
         return;
-
-    if (g_vcSpace == ECursorSpace::Window) {
-        const auto* E = g_world.find(g_vcId);
-
-        if (E && E->logicalWidth > 0 && E->logicalHeight > 0) {
-            Vector2D next = g_vcLocal + Vector2D{dx, dy};
-
-            // A held button keeps the window: a drag-select runs to the
-            // edge and stays there, like on a flat desktop.
-            if (g_clientButtonDown) {
-                next = Vector2D{std::clamp(next.x, 0.0, (double)E->logicalWidth),
-                                std::clamp(next.y, 0.0, (double)E->logicalHeight)};
-                g_vcLocal = next;
-                g_clientButtonLocal = surfaceLocal(*E, g_vcLocal);
-                vcDeliverMotion();
-                return;
-            }
-
-            const bool INSIDE = next.x >= 0 && next.y >= 0 &&
-                next.x <= E->logicalWidth && next.y <= E->logicalHeight;
-
-            Vector2D projected;
-            const bool ON_SCREEN =
-                projectToScreen(MON, windowPoint(*E, next), projected);
-
-            if (INSIDE) {
-                // The part of the window under a bar is the bar's.
-                if (ON_SCREEN && g_cfgUnderLayers &&
-                    Compat::interactiveLayerAt(MON, MON->m_position + projected)) {
-                    g_vcScreen = projected;
-                    vcLeaveToDesktop(MON->m_position + projected);
-                    return;
-                }
-
-                g_vcLocal = next;
-                if (ON_SCREEN)
-                    g_vcScreen = projected;
-                vcDeliverMotion();
-                return;
-            }
-
-            // Off the window's edge: carry on in screen space from where the
-            // exit point appears on screen.
-            if (ON_SCREEN)
-                g_vcScreen = projected;
-        }
-
-        Compat::clearPointerFocus();
-        g_vcSpace = ECursorSpace::Screen;
-        g_vcId    = 0;
-        vcResolveScreen(MON);
-        return;
-    }
 
     if (g_vcSpace != ECursorSpace::Screen)
         return;
@@ -5169,40 +5131,12 @@ static void updatePointerVisual() {
     const auto MON = targetMonitor();
 
     if (virtualCursor() && MON && g_vcSpace != ECursorSpace::Desktop) {
-        const auto* E = g_vcSpace == ECursorSpace::Window ?
-            g_world.find(g_vcId) : nullptr;
-
-        if (E && E->logicalWidth > 0) {
-            P.mode    = GLScene::SPointer::EMode::World;
-            P.tip     = windowPoint(*E, g_vcLocal);
-            P.right   = g_world.rightOf(E->id);
-            P.down    = g_world.upOf(E->id) * -1.0f;
-            P.pxWorld = E->width / E->logicalWidth;
-
-            // On a window it shows what that client asked for (text beam,
-            // resize arrows, hand...), in the window's plane.
-            SP<Render::ITexture> TEX;
-            Vector2D SIZE, HOT;
-            if (clientCursorImage(TEX, SIZE, HOT)) {
-                g_cursorTexHold = TEX;
-                P.texture = TEX->m_texID;
-                P.texW    = static_cast<float>(SIZE.x);
-                P.texH    = static_cast<float>(SIZE.y);
-                P.hotX    = static_cast<float>(HOT.x);
-                P.hotY    = static_cast<float>(HOT.y);
-            }
-        } else {
-            // The window went away under the cursor: the next move
-            // re-resolves from the last screen point.
-            if (g_vcSpace == ECursorSpace::Window) {
-                g_vcSpace = ECursorSpace::Screen;
-                g_vcId    = 0;
-            }
-
-            P.mode = GLScene::SPointer::EMode::Screen;
-            P.ndcX = static_cast<float>(g_vcScreen.x / MON->m_size.x) * 2.0f - 1.0f;
-            P.ndcY = 1.0f - static_cast<float>(g_vcScreen.y / MON->m_size.y) * 2.0f;
-        }
+        // One plain cursor over the whole screen: a flat arrow at the
+        // screen point, never a per-window one and never the client's own
+        // cursor image. Windows under the point get the input instead.
+        P.mode = GLScene::SPointer::EMode::Screen;
+        P.ndcX = static_cast<float>(g_vcScreen.x / MON->m_size.x) * 2.0f - 1.0f;
+        P.ndcY = 1.0f - static_cast<float>(g_vcScreen.y / MON->m_size.y) * 2.0f;
     }
 
     g_scene.setPointer(P);
@@ -5352,7 +5286,7 @@ static void setKeyboardMode(EKeyboardMode mode) {
         !pointerFree() ?
             "[hypr3d] keyboard: window (typing reaches the focused window)" :
         virtualCursor() ?
-            "[hypr3d] typing: cursor on the windows (toggle again to return)" :
+            "[hypr3d] typing: cursor over the windows (toggle again to return)" :
             "[hypr3d] typing: free cursor (toggle again / click the room to return)",
         CHyprColor{0.2f, 0.8f, 0.4f, 1.0f}
     );
@@ -5444,7 +5378,7 @@ static void onMouseAxis(
 
         info.cancelled = true;
 
-        if (g_vcSpace == ECursorSpace::Window) {
+        if (g_vcId) {
             vcDeliverMotion();
             Compat::deliverAxis(event.timeMs, event.axis, event.delta,
                                 event.deltaDiscrete, event.source,
@@ -5665,7 +5599,8 @@ static void onMouseButton(
             return;
         }
 
-        if (g_vcSpace != ECursorSpace::Window || g_clientButtonDown)
+        // Clicks translate to the window under the plain screen cursor.
+        if (!g_vcId || g_clientButtonDown)
             return;
 
         const auto* E = g_world.find(g_vcId);
