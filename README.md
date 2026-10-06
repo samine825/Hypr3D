@@ -167,10 +167,10 @@ Everything is optional -- only set what you want to change.
 
 ### Input
 
-| Option        | Type          | Default | Description |
-| ---------------| ---------------| ---------| -------------|
-| typing_cursor | bool          | false   | window (typing) mode also frees the pointer: the view freezes, the crosshair hides and a cursor appears on the windows. It moves in each window's own pixels whatever the window's angle (click, drag-select and scroll as usual, with the client's own cursor image), crosses into any window it passes (focusing it), and past the room monitor's edge continues as the normal cursor on the other monitors |
-| typing_button | string/number | none    | a mouse button that toggles window mode: `side`, `extra`, `forward`, `back`, `task`, or a Linux button code |
+| Option        | Type          | Default | Description                                                                                                                                                                                                                                                                                                                                                                                                   |
+| ---------------| ---------------| ---------| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| typing_cursor | bool          | true   | window (typing) mode also frees the pointer: the view freezes, the crosshair hides and a cursor appears on the windows. It moves in each window's own pixels whatever the window's angle (click, drag-select and scroll as usual, with the client's own cursor image), crosses into any window it passes (focusing it), and past the room monitor's edge continues as the normal cursor on the other monitors |
+| typing_button | string/number | none    | a mouse button that toggles window mode: `side`, `extra`, `forward`, `back`, `task`, or a Linux button code                                                                                                                                                                                                                                                                                                   |
 
 ### Player
 
