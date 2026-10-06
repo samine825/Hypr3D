@@ -428,7 +428,10 @@ static bool        g_cfgGrid = true;
 // world.under_layers: draw the room under the top and overlay layers (bars,
 // launchers, notifications stay 2D on top and take input) instead of over
 // everything.
-static bool        g_cfgUnderLayers = false;             // base grid platform on/off
+// Default ON: bars/launchers/notifications (Quickshell, Waybar, ...) stay
+// ordinary 2D surfaces over the room instead of becoming 3D panels. Set
+// world.under_layers = false to return to panels-in-the-room.
+static bool        g_cfgUnderLayers = true;
 
 // --- windows ----------------------------------------------------------------
 static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
