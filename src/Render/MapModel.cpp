@@ -383,6 +383,18 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                 for (int c = 0; c < 4; ++c)
                     out.color[c] = static_cast<float>(PBR.base_color_factor[c]);
 
+                // KHR_materials_pbrSpecularGlossiness (older Sketchfab and
+                // AI-generated exports) keeps the colour in its diffuse
+                // texture/factor and leaves the metallic-roughness base empty;
+                // without this such models came out plain white.
+                const bool SPEC_GLOSS =
+                    prim->material->has_pbr_specular_glossiness &&
+                    !PBR.base_color_texture.texture;
+                const auto& SG = prim->material->pbr_specular_glossiness;
+                if (SPEC_GLOSS)
+                    for (int c = 0; c < 4; ++c)
+                        out.color[c] = static_cast<float>(SG.diffuse_factor[c]);
+
                 // Emissive: factor defaults to black per spec, strength to 1
                 // unless KHR_materials_emissive_strength says otherwise.
                 // NOTE: black factor really means "no emission" -- e.g. the
@@ -398,9 +410,13 @@ bool CMapModel::load(const std::string& path, const Vec3& position,
                                 .emissive_strength) :
                         1.0f;
 
-                if (PBR.base_color_texture.texture &&
-                    PBR.base_color_texture.texture->image) {
-                    const auto* IMG = PBR.base_color_texture.texture->image;
+                // KHR_materials_pbrSpecularGlossiness keeps the colour in its
+                // diffuse texture; the metallic-roughness base is empty there.
+                const auto& BASE_TEX = SPEC_GLOSS ? SG.diffuse_texture
+                                                  : PBR.base_color_texture;
+
+                if (BASE_TEX.texture && BASE_TEX.texture->image) {
+                    const auto* IMG = BASE_TEX.texture->image;
                     const auto  IDX = static_cast<size_t>(IMG - data->images);
 
                     if (IDX < imageTextures.size()) {

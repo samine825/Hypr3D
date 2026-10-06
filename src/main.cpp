@@ -843,11 +843,18 @@ static void joltSyncBodies() {
                 SHAPE = RES.Get();
             } else {
                 // Dynamic/kinematic bodies use a convex hull (Jolt requires
-                // it; the hull also tumbles believably).
+                // it; the hull also tumbles believably). Dense meshes are
+                // sampled down first: hulling every vertex of a ~2M-triangle
+                // model (6M points) stalled the compositor, and a hull of a
+                // few tens of thousands of points looks the same.
+                constexpr size_t MAX_HULL_TRIS = 20000;
+                const size_t STRIDE =
+                    std::max<size_t>(1, LOCAL.size() / MAX_HULL_TRIS);
+
                 JPH::Array<JPH::Vec3> POINTS;
-                POINTS.reserve(LOCAL.size() * 3);
-                for (const auto& T : LOCAL)
-                    for (const Vec3* P : {&T.a, &T.b, &T.c}) {
+                POINTS.reserve((LOCAL.size() / STRIDE + 1) * 3);
+                for (size_t t = 0; t < LOCAL.size(); t += STRIDE)
+                    for (const Vec3* P : {&LOCAL[t].a, &LOCAL[t].b, &LOCAL[t].c}) {
                         const Vec3 Q = BODY_PT(*P);
                         POINTS.push_back(JPH::Vec3(Q.x, Q.y, Q.z));
                     }
