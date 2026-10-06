@@ -5,6 +5,7 @@
 #include <hyprland/src/desktop/view/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/layout/algorithm/Algorithm.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
@@ -15,6 +16,7 @@
 #include <hyprland/src/render/Renderer.hpp>
 
 #include <hyprutils/utils/ScopeGuard.hpp>
+#include <algorithm>
 #include <cmath>
 
 namespace H3D::Compat {
@@ -180,6 +182,7 @@ void applyWindowGhost(SWindowLayoutSave& save) {
     // it out of the layout so a tiled layout cannot overwrite our changes.
     WINDOW->m_target->setFloating(true);
     WINDOW->m_target->setSpaceGhost(save.space);
+    save.ghosted = true;
 }
 
 void restoreWindowLayout(SWindowLayoutSave& save) {
@@ -191,6 +194,24 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     if (!WINDOW || !WINDOW->m_target)
         return;
 
+    if (!save.ghosted) {
+        // The window never left the layout: its tree node is alive, its
+        // floating flag was never flipped (the room's box drives go through
+        // driveWindowBox), and the exit morph already landed the box where
+        // the tree expects it. Nothing to re-adopt -- calling the
+        // algorithm's remove/re-insert here would DESTROY the live node
+        // and a rebuild could only approximate it. Pin the remembered
+        // floating size to the current box so a later manual float uses
+        // the geometry this window actually has.
+        WINDOW->m_target->rememberFloatingSize(
+            Vector2D{WINDOW->m_target->position().w,
+                     WINDOW->m_target->position().h});
+
+        if (g_pHyprRenderer)
+            g_pHyprRenderer->damageWindow(WINDOW);
+        return;
+    }
+
     // Clear the ghost link FIRST. assignToSpace straight from the ghost
     // state takes the space->move() branch (the ghosted target was never a
     // member of its space, but HAD_SPACE reads true from the ghost
@@ -200,43 +221,99 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     // target into the layout algorithm.
     WINDOW->m_target->setSpaceGhost(nullptr);
 
-    // The exact box the window had when 3D was entered -- for floating
-    // windows too: sizes are per-mode, and a 3D resize must not survive
-    // into 2D (the exit morph animates the real box back to this one).
-    const CBox RESTORE_BOX = save.box;
-
     if (save.space)
         WINDOW->m_target->assignToSpace(save.space);
     else
         WINDOW->m_target->assignToSpace(nullptr); // force-clear the ghost flag
 
     if (save.wasFloating) {
-        WINDOW->m_target->setPositionGlobal(RESTORE_BOX);
-        WINDOW->m_target->rememberFloatingSize(
-            Vector2D{RESTORE_BOX.w, RESTORE_BOX.h});
-    } else {
-        // The canonical float->tile transition. The bare
-        // m_target->setFloating(false) only flips the flag and notifies
-        // rules -- the layout algorithm's own floating-target bookkeeping
-        // never hears about it, and the window ends up positioned but
-        // unmanaged: frozen outside the layout until the next interaction
-        // adopts it. CSpace::toggleTargetFloating is what Hyprland's own
-        // changeFloatingMode calls; it routes through
-        // CAlgorithm::setFloating (remove + re-insert by the new state).
-        if (save.space)
-            save.space->toggleTargetFloating(WINDOW->m_target);
-        else
-            WINDOW->m_target->setFloating(false);
-
-        // Pin the exact pre-3D tile box on top of the algorithm's
-        // arrangement (same insertion order reproduces the same layout;
-        // this covers the corner cases).
-        WINDOW->m_target->setPositionGlobal(RESTORE_BOX);
-        WINDOW->m_target->rememberFloatingSize(
-            Vector2D{RESTORE_BOX.w, RESTORE_BOX.h});
+        // The exact box the window had when 3D was entered: sizes are
+        // per-mode, and a 3D resize must not survive into 2D (the exit
+        // morph animates the real box back to this one).
+        WINDOW->m_target->setPositionGlobal(save.box);
+        WINDOW->m_target->rememberFloatingSize(Vector2D{save.box.w, save.box.h});
+        g_pHyprRenderer->damageWindow(WINDOW);
+        return;
     }
 
-    g_pHyprRenderer->damageWindow(WINDOW);
+    // Tiled: adopt into the layout algorithm's TREE. The space->add() above
+    // routed the target into the algorithm's FLOATING list (addTarget
+    // follows the floating flag the ghost left set); moving it to the tiled
+    // side needs the algorithm itself -- a bare setFloating(false) only
+    // flips a flag and the window ends up positioned but unmanaged.
+    //
+    // The re-insert carries the saved box's CENTRE as the focal point: the
+    // tiled algorithm splits the node closest to it, so the rebuilt tree
+    // mirrors the saved arrangement instead of scattering around wherever
+    // the mouse happens to be. Geometry is not final here -- the settle
+    // pass recalculates once and pins the exact saved boxes after ALL
+    // windows are in (an earlier pin would be overridden by the next
+    // window's insertion recalcs).
+    bool adopted = false;
+
+    if (save.space) {
+        if (const auto ALGO = save.space->algorithm()) {
+            ALGO->removeTarget(WINDOW->m_target);
+            WINDOW->m_target->setFloating(false);
+            ALGO->moveTarget(WINDOW->m_target, save.box.middle());
+            adopted = true;
+        }
+    }
+
+    if (!adopted)
+        WINDOW->m_target->setFloating(false);
+}
+
+void restoreWindowLayoutSettle(const std::vector<SWindowLayoutSave>& saves) {
+    // One recalculate per involved space: normalizes gaps/workarea over the
+    // rebuilt tree.
+    std::vector<SP<Layout::CSpace>> spaces;
+
+    for (const auto& SAVE : saves) {
+        if (!SAVE.space || SAVE.window.expired())
+            continue;
+
+        if (std::ranges::find(spaces, SAVE.space) == spaces.end())
+            spaces.push_back(SAVE.space);
+    }
+
+    for (const auto& SPACE : spaces)
+        SPACE->recalculate();
+
+    // The tree was never torn down, so the recalculate re-asserts the
+    // ORIGINAL arrangement -- no pins on top (they would only fight a
+    // legitimate mid-session reflow). Ghosted windows (the fullscreen one,
+    // session newcomers) were restored by their own full path.
+    for (const auto& SAVE : saves) {
+        const auto WINDOW = SAVE.window.lock();
+
+        if (WINDOW && g_pHyprRenderer)
+            g_pHyprRenderer->damageWindow(WINDOW);
+    }
+}
+
+bool driveWindowBox(const PHLWINDOW& window, const CBox& box) {
+    if (!window || !window->m_target)
+        return false;
+
+    const CBox CURRENT = window->m_target->position();
+
+    const bool unchanged =
+        std::fabs(CURRENT.x - box.x) < 0.01 &&
+        std::fabs(CURRENT.y - box.y) < 0.01 &&
+        std::fabs(CURRENT.w - box.w) < 0.01 &&
+        std::fabs(CURRENT.h - box.h) < 0.01;
+
+    if (unchanged)
+        return false;
+
+    window->m_target->setPositionGlobal(box);
+    window->m_target->rememberFloatingSize(Vector2D{box.w, box.h});
+
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->damageWindow(window);
+
+    return true;
 }
 
 CBox currentWindowBox(const PHLWINDOW& window) {

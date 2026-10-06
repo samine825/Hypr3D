@@ -61,14 +61,35 @@ struct SWindowLayoutSave {
     CBox           box;   // global logical box at save time
     SP<Layout::CSpace> space;
     bool            wasFloating = false;
+    // Set by applyWindowGhost: the window actually left the layout (the
+    // fullscreen window at entry, windows mapped during the session). Such
+    // windows need the full space/algorithm re-adoption on restore; the
+    // rest only need their flag and box pinned back (their tree node was
+    // never removed).
+    bool            ghosted = false;
 };
 
 SWindowLayoutSave saveWindowLayout(const PHLWINDOW& window);
 void              applyWindowGhost(SWindowLayoutSave& save);
 void              restoreWindowLayout(SWindowLayoutSave& save);
 
+// Final pass after ALL restoreWindowLayout calls: one recalculate per
+// involved space, then the saved tile boxes are pinned on top (and every
+// window damaged). restoreWindowLayout inserts tiled windows into the
+// algorithm's tree at their saved box's centre, so the rebuilt tree mirrors
+// the saved arrangement instead of following the mouse.
+void              restoreWindowLayoutSettle(const std::vector<SWindowLayoutSave>& saves);
+
 CBox currentWindowBox(const PHLWINDOW& window);
 bool setWindowBox(const PHLWINDOW& window, const CBox& box);
+
+// Like setWindowBox, but WITHOUT the setFloating(true) flip: the window
+// keeps its layout membership and floating flag exactly as they are (a
+// tiled window's tree node stays put). This is how the room drives a real
+// resize or a morph's box animation for a window that lives inside the
+// layout -- the algorithm never hears about it, and the exit's light
+// restore has nothing to undo but the box itself.
+bool driveWindowBox(const PHLWINDOW& window, const CBox& box);
 
 // --- pointer delivery -------------------------------------------------------
 //

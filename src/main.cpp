@@ -73,6 +73,7 @@ extern "C" {
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace H3D {
@@ -117,6 +118,18 @@ static bool g_reportedPointerHookError = false;
 static std::vector<Compat::SWindowLayoutSave> g_layoutSaves;
 static bool g_ghosted = false;
 
+// The windows that were already mapped when 3D opened. They keep their live
+// layout membership for the whole session (the tiling tree survives
+// untouched); only the fullscreen window (ghosted at enter3D) and windows
+// that map while the view is open leave the layout.
+static std::unordered_set<std::uintptr_t> g_sessionWindows;
+
+// Windows whose real box the room drove THIS session (the enter morph's
+// drive to the remembered room box, and 3D resizes). The exit morph animates
+// exactly these back to their saved 2D boxes; a box changed by the layout
+// itself (a mid-session reflow) is left alone -- the tree owns it.
+static std::unordered_set<std::uintptr_t> g_boxDriven;
+
 // --- 2D/3D independent positions + the view morph ---------------------------
 //
 // Positions are per-mode. The desktop keeps its own layout (ghosting
@@ -134,9 +147,10 @@ struct SViewPose {
     float pitch = 0.f;
     float roll  = 0.f;
 
-    // The room-content box (monitor-local px): sizes are per-mode too, so
-    // the window's real box is driven back to this on the next entry (and
-    // to the 2D box on exit). Empty = never sized in the room.
+    // The window's real box as it lived in the ROOM (monitor-local px).
+    // Sizes are per-mode: on entry the morph drives the real box here (the
+    // client re-renders at the room's size -- crisp content), on exit back
+    // to the 2D box. Empty = never sized in the room.
     CBox box{};
 };
 
@@ -147,10 +161,16 @@ static std::unordered_map<std::uintptr_t, SViewPose> g_savedPoses;
 enum class EViewMorph : uint8_t { None, To3D, To2D };
 static EViewMorph g_viewMorph = EViewMorph::None;
 
-// Per-window morph endpoints, captured once when the morph starts.
+// Per-window morph endpoints, captured once when the morph starts. The
+// room never ghosts pre-existing windows, so the layout owns the real
+// geometry in both modes; the morph's box animation drives the real box
+// between the 2D box and the remembered room box ONLY for windows whose
+// two differ (a 3D resize) -- the client re-renders along the way, so the
+// content inside the quad never jumps scale, and the tree node underneath
+// is untouched (flag flips only, no algorithm bookkeeping).
 struct SViewMorphWin {
     CBox      box2D{};    // monitor-local: the 2D rect covered at s=0
-    CBox      boxRoom{};  // monitor-local: the box whose content the room shows
+    CBox      boxRoom{};  // monitor-local: the room's real box at s=1
     SViewPose roomPose{}; // the room pose at s=1
     bool      animBox = false; // drive the real box between the two
     float     stack   = 0.f;   // world units toward the eye (2D stacking)
@@ -1091,21 +1111,34 @@ static void ghostWindows(
     const auto& LIST = *list;
 
     if (!g_ghosted) {
-        // First pass: save EVERY window before ghosting any of them, since
-        // ghosting one window triggers a relayout of the ones still attached,
-        // which would corrupt boxes captured afterwards.
-        g_layoutSaves.clear();
-        g_layoutSaves.reserve(LIST.size());
+        // The windows that were already mapped when 3D opened KEEP their
+        // live layout membership: the tiling tree survives the session
+        // untouched, so the 2D arrangement after the exit is the original
+        // one -- exact, with nothing to reconstruct. Their geometry is only
+        // REMEMBERED here (the exit morph animates a 3D-resized window's
+        // real box back to it). The fullscreen window was already saved and
+        // ghosted at enter3D; everything else is saved without ghosting.
+        g_layoutSaves.reserve(g_layoutSaves.size() + LIST.size());
+        g_sessionWindows.clear();
 
         for (const auto& info : LIST) {
+            g_sessionWindows.insert(info.id);
+
+            bool saved = false;
+            for (const auto& SAVE : g_layoutSaves)
+                if (SAVE.id == info.id) {
+                    saved = true;
+                    break;
+                }
+
+            if (saved)
+                continue; // the fullscreen window, handled at enter3D
+
             auto SAVE = Compat::saveWindowLayout(info.window);
 
             if (SAVE.window)
                 g_layoutSaves.push_back(std::move(SAVE));
         }
-
-        for (auto& save : g_layoutSaves)
-            Compat::applyWindowGhost(save);
 
         g_ghosted = true;
         return;
@@ -1117,17 +1150,8 @@ static void ghostWindows(
     // around it. The live weak reference guards against a new window reusing
     // a closed one's address.
     for (const auto& info : LIST) {
-        bool known = false;
-
-        for (const auto& save : g_layoutSaves) {
-            if (save.id == info.id && !save.window.expired()) {
-                known = true;
-                break;
-            }
-        }
-
-        if (known)
-            continue;
+        if (g_sessionWindows.count(info.id))
+            continue; // was mapped at entry: keeps its layout membership
 
         // A window that appears while the view is open becomes a small
         // floating panel instead of a fullscreen tile -- resized BEFORE the
@@ -1163,8 +1187,14 @@ static void unghostWindows() {
 
     // Force the exact saved geometry back, so leaving 3D never disturbs the
     // user's 2D arrangement. The 3D arrangement is a view, not an edit.
+    // Tiled windows are re-inserted into the layout algorithm's tree at
+    // their saved spots (see restoreWindowLayout); the settle pass then
+    // recalculates once and pins the exact saved boxes -- pinning earlier
+    // would be overridden by the following windows' insertion recalcs.
     for (auto& save : g_layoutSaves)
         Compat::restoreWindowLayout(save);
+
+    Compat::restoreWindowLayoutSettle(g_layoutSaves);
 
     g_layoutSaves.clear();
     g_ghosted = false;
@@ -1284,11 +1314,10 @@ static void refreshCaptures(
         const bool ALPHA_GRACE = info.window &&
             alphaGrace.count(info.id) > 0;
 
-        // During the view morph the quads' content is static -- only the
-        // animBox windows need retakes (their real boxes resize, and the
-        // buffer-change check catches exactly those). The usual FORCE
-        // sources (the ghost fade keeping alpha channels in flight, aim,
-        // focus) would retake EVERY window at full rate for the whole
+        // During the view morph the quads' content is static (the room
+        // never drives the real boxes), so nothing needs retakes. The usual
+        // FORCE sources (the ghost fade keeping alpha channels in flight,
+        // aim, focus) would retake EVERY window at full rate for the whole
         // transition -- the FPS crater. A mid-fade snapshot would bake
         // partial alpha anyway; keeping the last good one is better.
         const bool MORPHING = g_viewMorph != EViewMorph::None;
@@ -1298,7 +1327,6 @@ static void refreshCaptures(
             ALPHA_GRACE ||
             info.id == g_lastAimedId ||
             (g_world.dragActive() && g_world.draggedId() == info.id) ||
-            (g_resize.active && g_resize.id == info.id) ||
             info.id == FOCUSED_ID);
 
         bool consumedSkirt = false;
@@ -1461,11 +1489,11 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             continue;
 
         // Everything below uses the geometry captured WITH the snapshot, not
-        // the live box: updateRealResize writes the real window after
-        // render.pre, so the live box can be a frame ahead of the captured
-        // pixels. Quad, UV subrect and picking all follow the snapshot box,
-        // which keeps the drawn content and the crosshair mapping aligned
-        // during resizes -- otherwise the edges smear across the frame delta.
+        // the live box: the client's commit can land after render.pre, so
+        // the live box can be a frame ahead of the captured pixels. Quad,
+        // UV subrect and picking all follow the snapshot box, which keeps
+        // the drawn content and the crosshair mapping aligned -- otherwise
+        // the edges smear across the frame delta.
         const CBox& BOX = SNAPSHOT->sampledBox;
 
         World3D::SEntity entity;
@@ -1551,10 +1579,12 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.pitch = std::asin(std::clamp(FWD.y, -1.0f, 1.0f));
         }
 
-        // The quad size ALWAYS follows the snapshot box (times the spawn
-        // scale): the UV subrect and the input mapping are box-relative, so a
-        // stale world size would squish the content and shrink the input zone
-        // on every resize.
+        // The quad size follows the snapshot box (times the config scale):
+        // the real box IS the room's content resolution -- a 3D resize is a
+        // real resize (the client re-renders, crisp at any size), and the
+        // per-mode size memory lives in the box animation of the view morph
+        // (enter drives the real box to the remembered room box, exit back
+        // to the 2D box).
         entity.width  = World3D::toWorld(BOX.w) * entity.spawnScale;
         entity.height = World3D::toWorld(BOX.h) * entity.spawnScale;
 
@@ -2278,11 +2308,11 @@ static void applyFullscreenAnimation() {
 // quad covers its on-screen spot exactly, the fullscreen passthrough's
 // construction generalized to every window. Entering 3D, the quads take off
 // from those poses and fly to the room poses while the environment fades in
-// per-pixel; leaving 3D reverses it. Windows whose 2D box differs from the
-// room box (tiled windows force-floated by the ghosting) animate their REAL
-// box along the way, so the client re-renders mid-flight and the content
-// inside the quad never jumps scale -- the same trick the fullscreen
-// transition uses for its restore box.
+// per-pixel; leaving 3D reverses it. The layout tree is never torn down
+// (pre-existing windows keep their membership), so a window whose room box
+// differs from its 2D box (a 3D resize) animates its REAL box between the
+// two -- the client re-renders mid-flight, the content never jumps scale,
+// and the exit lands on the exact saved 2D geometry.
 
 static CBox viewMorphLocalBox(const PHLMONITOR& mon, const CBox& global) {
     return CBox{
@@ -2312,12 +2342,12 @@ static bool boxesDiffer(const CBox& A, const CBox& B) {
         std::fabs(A.w - B.w) > 0.5 || std::fabs(A.h - B.h) > 0.5;
 }
 
-// Entered 3D: the pre-ghost snapshots exist (serviceCapture captured them
-// before the ghosting), so the takeoff endpoints are known: box2D from the
-// snapshot (the 2D look), boxRoom from the post-ghost real box, room poses
-// from the saved memory (or the fresh spawn in front of the camera).
+// Entered 3D: the morph table -- room poses (and remembered world sizes)
+// from the memory, or the fresh spawn in front of the camera. The takeoff
+// rectangle is always the live box: the layout owns the real geometry in
+// both modes.
 static void buildEnterMorph(
-    const PHLMONITOR& mon, const std::vector<Compat::SWindowInfo>& infos) {
+    const PHLMONITOR& /*mon*/, const std::vector<Compat::SWindowInfo>& infos) {
     g_viewMorphWins.clear();
 
     const auto& CAM = g_scene.camera();
@@ -2333,24 +2363,16 @@ static void buildEnterMorph(
         MW.box2D = SNAPSHOT ? SNAPSHOT->sampledBox : info.monitorLocalBox;
         MW.boxRoom = MW.box2D;
 
-        if (info.window)
-            MW.boxRoom = viewMorphLocalBox(
-                mon, Compat::currentWindowBox(info.window));
-
         if (const auto POSE = g_savedPoses.find(info.id);
             POSE != g_savedPoses.end()) {
             MW.roomPose = POSE->second;
 
-            // Sizes are per-mode: the room keeps the box the window had
-            // here last time. The real box (and with it the content
-            // resolution) is driven there by the morph; the position stays
-            // wherever the ghosting put it -- only the size matters.
-            if (info.window && MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0) {
-                const CBox CUR = viewMorphLocalBox(
-                    mon, Compat::currentWindowBox(info.window));
-                MW.boxRoom = CBox{CUR.x, CUR.y,
-                                  MW.roomPose.box.w, MW.roomPose.box.h};
-            }
+            // Sizes are per-mode: the room keeps the real box the window
+            // had here last time. The morph drives the real box there (the
+            // client re-renders -- crisp content at the room's size); the
+            // layout tree underneath is untouched.
+            if (MW.roomPose.box.w > 1.0 && MW.roomPose.box.h > 1.0)
+                MW.boxRoom = MW.roomPose.box;
         } else {
             // The same fresh spawn syncWorld seeds for unknown windows.
             MW.roomPose.center = CAM.position + FWD * g_cfgSpawnDistance;
@@ -2360,6 +2382,9 @@ static void buildEnterMorph(
         }
 
         MW.animBox = info.window && boxesDiffer(MW.box2D, MW.boxRoom);
+
+        if (MW.animBox)
+            g_boxDriven.insert(info.id); // the exit morph undoes this drive
 
         MW.stack = static_cast<float>(i) * kMorphStackEps;
         ++i;
@@ -2386,25 +2411,19 @@ static void beginExit3D() {
     if (g_fsPhase != EFullscreenPhase::None || !MON)
         return;
 
-    const auto INFOS = Compat::enumerateEligibleWindows(MON);
-
     // An interrupted ENTER morph contributes its intended room poses.
     const auto PREVIOUS = std::move(g_viewMorphWins);
 
-    g_savedPoses.clear();
+    if (!g_world.entities().empty())
+        g_savedPoses.clear(); // rebuilt from the live room below; an empty
+                              // room (toggled off before the first frame)
+                              // keeps the previous session's memory
     g_viewMorphWins.clear();
 
     int i = 0;
 
     for (const auto& ENTITY : g_world.entities()) {
         SViewMorphWin MW;
-
-        const auto* SNAPSHOT = g_capture.get(ENTITY.id);
-
-        MW.boxRoom = SNAPSHOT ?
-            SNAPSHOT->sampledBox :
-            CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
-                 ENTITY.logicalWidth, ENTITY.logicalHeight};
 
         // The intended room pose: mid-flight exits keep the destination.
         if (auto POSE = PREVIOUS.find(ENTITY.id); POSE != PREVIOUS.end()) {
@@ -2414,23 +2433,28 @@ static void beginExit3D() {
                 ENTITY.center, ENTITY.yaw, ENTITY.pitch, ENTITY.roll};
         }
 
-        // Sizes are per-mode: the room-content box rides the memory, and
-        // the next entry drives the real box back to it.
+        // The room's real box rides the memory -- the next entry drives the
+        // real box back to it (sizes are per-mode).
+        const auto* SNAPSHOT = g_capture.get(ENTITY.id);
+
+        MW.boxRoom = SNAPSHOT ?
+            SNAPSHOT->sampledBox :
+            CBox{ENTITY.logicalLeft, ENTITY.logicalTop,
+                 ENTITY.logicalWidth, ENTITY.logicalHeight};
         MW.roomPose.box = MW.boxRoom;
 
         g_savedPoses[ENTITY.id] = MW.roomPose;
 
-        // The 2D box the window must land on: the one it had when 3D was
-        // entered -- for FLOATING windows too. A 3D resize is a 3D resize;
-        // the exit morph animates the real box back, so the desktop keeps
-        // its own sizes exactly.
+        // The 2D box the window must land on. Only windows whose box the
+        // ROOM drove (the enter morph's drive to the remembered room box,
+        // 3D resizes) are animated back to their saved 2D box; a box the
+        // LAYOUT changed mid-session (a reflow after a window opened or
+        // closed) belongs to the tree and is left exactly where the tree
+        // put it.
         MW.box2D   = MW.boxRoom;
         MW.animBox = false;
 
-        for (const auto& info : INFOS) {
-            if (info.id != ENTITY.id || !info.window)
-                continue;
-
+        if (g_boxDriven.count(ENTITY.id)) {
             for (const auto& SAVE : g_layoutSaves) {
                 if (SAVE.id != ENTITY.id)
                     continue;
@@ -2441,8 +2465,6 @@ static void beginExit3D() {
 
                 break;
             }
-
-            break;
         }
 
         MW.stack = static_cast<float>(i) * kMorphStackEps;
@@ -2456,8 +2478,9 @@ static void beginExit3D() {
 
 // One morph frame: quad pose = lerp(screen pose of the current snapshot box,
 // room pose, s); size lerp(1:1, config scale, s); the real box follows the
-// same s for animBox windows. Written into BOTH the render entry (zero lag)
-// and the entity (picking + next frame's reseed agree with the render).
+// same s for animBox windows (a 3D resize's box memory). Written into BOTH
+// the render entry (zero lag) and the entity (picking + next frame's reseed
+// agree with the render).
 static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
     if (!mon)
         return;
@@ -2488,10 +2511,12 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
             if (auto W = Compat::findWindowById(RW.id)) {
                 const CBox TARGET = lerpBox(MW.box2D, MW.boxRoom, s);
 
-                Compat::setWindowBox(
+                Compat::driveWindowBox(
                     W,
                     CBox{TARGET.x + mon->m_position.x,
                          TARGET.y + mon->m_position.y, TARGET.w, TARGET.h});
+
+                g_boxDriven.insert(RW.id);
             }
         }
 
@@ -2706,7 +2731,15 @@ static void updateRealResize() {
         return;
 
     const CBox BOX = resizeBoxFromAim(point, MON);
-    Compat::setWindowBox(g_resize.window, BOX);
+
+    // A real resize: the client re-renders at the new size, so the content
+    // stays crisp at any room size. The 2D box is remembered at entry and
+    // the exit morph animates the real box back to it -- sizes stay
+    // per-mode without stretching the texture. The drive goes through
+    // driveWindowBox: no floating-flag flip, the layout tree node is
+    // untouched.
+    Compat::driveWindowBox(g_resize.window, BOX);
+    g_boxDriven.insert(g_resize.id);
 }
 
 static void resetPointerGesture() {
@@ -2865,6 +2898,8 @@ static void deactivate3D() {
     g_viewMorphArmed  = false;
     g_viewMorphWins.clear();
     g_morphS = 1.0f;
+    g_boxDriven.clear();
+    g_sessionWindows.clear();
     g_capture.setSkirtDeferred(false);
 
     // Fullscreen passthrough state: back to plain 3D-off. Restore the real
@@ -2963,6 +2998,7 @@ static void enter3D() {
     g_viewMorphWins.clear();
     g_viewMorphArmed  = true;
     g_morphS          = 0.0f;
+    g_boxDriven.clear();
 
     // The pre-ghost captures must not pay for silhouette traces: the boxes
     // are about to be driven by the morph, and the analytic fallback
@@ -3014,6 +3050,10 @@ static void enter3D() {
     // standard spawn-sized floating panel (a fullscreened/tiled box would
     // otherwise enter the room monitor-sized AND pollute the stable-box
     // memory). The passthrough still triggers on the fullscreen EVENT.
+    // This is the ONE pre-existing window that leaves the layout: it is
+    // force-floated and ghosted, so the saved tree is not disturbed by the
+    // shrink, and the exit restores it as a floating panel (the FS exit
+    // path asserts that size).
     if (const auto MON = targetMonitor()) {
         if (const auto FSW =
                 Fullscreen::controller()->getFullscreenWindow(MON)) {
@@ -3024,6 +3064,15 @@ static void enter3D() {
                      MON->m_position.y + MON->m_size.y * 0.5 -
                          kSpawnHeight * 0.5,
                      kSpawnWidth, kSpawnHeight});
+
+            g_layoutSaves.clear(); // no stale saves may survive into this session
+
+            auto SAVE = Compat::saveWindowLayout(FSW);
+
+            if (SAVE.window) {
+                Compat::applyWindowGhost(SAVE);
+                g_layoutSaves.push_back(std::move(SAVE));
+            }
 
             g_fsLastFSWindow = FSW;
         }
@@ -4597,8 +4646,8 @@ static void onMouseButton(
             // side relative to the window centre, so the grab lands anywhere
             // on the window and the pull direction decides the rest. As the
             // camera turns, the current centre ray is intersected with this
-            // same window plane, so the real window stretches exactly toward
-            // the point being aimed at.
+            // same window plane, so the quad's room size follows exactly the
+            // point being aimed at -- the real window is untouched.
             // RayHit::v is already top-to-bottom. Top half follows +1,
             // bottom half follows -1 in the CBox edge convention below.
             g_resize.edgeX = HIT.u < 0.5f ? -1 : 1;
