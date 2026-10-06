@@ -1239,9 +1239,6 @@ static bool captureWanted() {
 }
 
 static void vcMove(double dx, double dy);
-static void refreshCursorImage();
-static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
-                              Vector2D& hotspot);
 
 // Whether a global logical point lies on the monitor the room is drawn on.
 static bool onRoomMonitor(const Vector2D& pos) {
@@ -3351,7 +3348,6 @@ static void onRenderPre(PHLMONITOR mon) {
 
     g_monitor = mon;
     serviceCapture();
-    refreshCursorImage();
 }
 
 
@@ -4525,6 +4521,10 @@ class CHypr3DPassElement final : public IPassElement {
 
 // Throttled snapshot of the live state, written where I can read it directly
 // instead of asking the user to describe what they see.
+// The cursor image the focused client last asked for (a diagnostic probe).
+static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
+                              Vector2D& hotspot);
+
 static void dumpStatus() {
     const auto NOW = std::chrono::steady_clock::now();
 
@@ -4888,14 +4888,6 @@ static bool projectToScreen(const PHLMONITOR& mon, const Vec3& point,
 
 // World point of a decorated-box px position on an entity (it may lie
 // outside the box, on the window's plane).
-static Vec3 windowPoint(const World3D::SEntity& e, const Vector2D& local) {
-    const float X =
-        (static_cast<float>(local.x) / e.logicalWidth - 0.5f) * e.width;
-    const float Y =
-        (0.5f - static_cast<float>(local.y) / e.logicalHeight) * e.height;
-
-    return e.center + g_world.rightOf(e.id) * X + g_world.upOf(e.id) * Y;
-}
 
 // Decorated-box px -> client-surface px, the border ring clamped to the
 // surface edge (the same mapping as localFromHit).
@@ -5006,8 +4998,14 @@ static void vcResolveScreen(const PHLMONITOR& mon) {
     if (g_clientButtonDown) {
         const World3D::SHit HELD = pickVisible(screenRay(mon, g_vcScreen));
 
-        if (HELD.hit && HELD.id == g_vcId)
+        if (HELD.hit && HELD.id == g_vcId) {
             vcEnterWindow(HELD); // refreshes the local + delivers motion
+
+            // The release must land where the drag ended, not where the
+            // press started -- or the client resets the selection.
+            if (auto* E = g_world.find(g_vcId))
+                g_clientButtonLocal = surfaceLocal(*E, g_vcLocal);
+        }
 
         return;
     }
@@ -5034,6 +5032,12 @@ static void vcMove(double dx, double dy) {
 
     g_vcScreen = g_vcScreen + Vector2D{dx, dy};
     vcResolveScreen(MON);
+
+    // The real cursor is the visual: follow the resolved point (skipped
+    // when the point left for a layer or another monitor -- there the real
+    // cursor is already free and placed).
+    if (g_vcSpace != ECursorSpace::Desktop)
+        Pointer::mgr()->warpTo(MON->m_position + g_vcScreen);
 }
 
 // Typing mode starts at the crosshair: whatever the view was aiming at is
@@ -5064,10 +5068,14 @@ static void vcEnterFromDesktop(const Vector2D& global) {
     Compat::clearPointerFocus();
     Compat::setPointerCapture(true);
 
-    if (Compat::setCursorHidden(true))
-        Pointer::mgr()->resetCursorImage();
+    Compat::setCursorHidden(false);
+    if (g_pHyprRenderer)
+        g_pHyprRenderer->setCursorFromName("default", true);
 
     vcResolveScreen(MON);
+
+    // Park the real cursor at the point it re-entered the room.
+    Pointer::mgr()->warpTo(MON->m_position + g_vcScreen);
 }
 
 // The client's cursor image, recorded by the pointer hooks while the real
@@ -5078,24 +5086,7 @@ static uint64_t             g_cursorSerial = 0;
 static SP<Render::ITexture> g_cursorBufferTex;
 
 // Kept alive until the next frame: the scene samples it inside the pass.
-static SP<Render::ITexture> g_cursorTexHold;
 
-static void refreshCursorImage() {
-    const auto& REQ = Compat::lastCursorRequest();
-
-    if (REQ.serial == g_cursorSerial)
-        return;
-
-    g_cursorSerial = REQ.serial;
-    g_cursorBufferTex.reset();
-
-    if (REQ.buffer && g_pHyprRenderer) {
-        if (Render::GL::g_pHyprOpenGL)
-            Render::GL::g_pHyprOpenGL->makeEGLCurrent();
-
-        g_cursorBufferTex = g_pHyprRenderer->createTexture(REQ.buffer);
-    }
-}
 
 // The current client cursor image: texture, logical size and hotspot. Only
 // plain RGBA textures; an external (EGLImage) one needs a different sampler,
@@ -5126,20 +5117,9 @@ static bool clientCursorImage(SP<Render::ITexture>& tex, Vector2D& size,
 
 // Where the scene draws the virtual cursor this frame.
 static void updatePointerVisual() {
-    GLScene::SPointer P;
-
-    const auto MON = targetMonitor();
-
-    if (virtualCursor() && MON && g_vcSpace != ECursorSpace::Desktop) {
-        // One plain cursor over the whole screen: a flat arrow at the
-        // screen point, never a per-window one and never the client's own
-        // cursor image. Windows under the point get the input instead.
-        P.mode = GLScene::SPointer::EMode::Screen;
-        P.ndcX = static_cast<float>(g_vcScreen.x / MON->m_size.x) * 2.0f - 1.0f;
-        P.ndcY = 1.0f - static_cast<float>(g_vcScreen.y / MON->m_size.y) * 2.0f;
-    }
-
-    g_scene.setPointer(P);
+    // The real cursor is the visual (Hyprland draws it at the warped
+    // position, standard theme and size) -- the scene draws nothing.
+    g_scene.setPointer({});
 }
 
 static void onRenderStage(eRenderStage stage) {
@@ -5251,8 +5231,14 @@ static void setKeyboardMode(EKeyboardMode mode) {
         Compat::clearPointerFocus();
 
         if (virtualCursor()) {
-            // The pointer stays captured and drives the plugin's cursor.
+            // The pointer stays captured and drives the virtual point, but
+            // the VISUAL is the real cursor: unhidden, standard theme and
+            // size, warped to the resolved point on every move.
             vcBegin();
+
+            Compat::setCursorHidden(false);
+            if (g_pHyprRenderer)
+                g_pHyprRenderer->setCursorFromName("default", true);
         } else {
             Compat::setPointerCapture(false);
             Compat::setCursorHidden(false);
@@ -7057,7 +7043,6 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (Render::GL::g_pHyprOpenGL) {
         Render::GL::g_pHyprOpenGL->makeEGLCurrent();
         g_cursorBufferTex.reset();
-        g_cursorTexHold.reset();
         g_scene.shutdown();
     }
 }
