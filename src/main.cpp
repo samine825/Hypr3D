@@ -367,8 +367,12 @@ static void buildEnterMorph(
 // Windows that appear while the view is open spawn as floating panels of
 // this logical size (see ghostWindows), and enter the room this far in front
 // of the camera, facing it.
-static constexpr float kSpawnWidth    = 960.0f;
-static constexpr float kSpawnHeight   = 540.0f;
+// windows.spawn_size: the logical box a window that appears while the view
+// is open starts at (see ghostWindows). A larger box with a smaller
+// window_scale gives the same panel in the room with more pixels (sharper,
+// more content), as if the window were further away.
+static float      g_cfgSpawnWidth  = 960.0f;
+static float      g_cfgSpawnHeight = 540.0f;
 static constexpr float kSpawnDistance = 10.0f;
 
 // A normal damage cycle stops when nothing else in Hyprland changes. 3D mode is
@@ -1200,13 +1204,13 @@ static void ghostWindows(
         // A dialog (a window with a parent) keeps the size it asked for.
         if (info.window && !info.window->parent()) {
             const double CX =
-                mon->m_position.x + mon->m_size.x * 0.5 - kSpawnWidth * 0.5;
+                mon->m_position.x + mon->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
             const double CY =
-                mon->m_position.y + mon->m_size.y * 0.5 - kSpawnHeight * 0.5;
+                mon->m_position.y + mon->m_size.y * 0.5 - g_cfgSpawnHeight * 0.5;
 
             Compat::setWindowBox(
                 info.window,
-                CBox{CX, CY, kSpawnWidth, kSpawnHeight}
+                CBox{CX, CY, g_cfgSpawnWidth, g_cfgSpawnHeight}
             );
 
             // The ghost is room-driven: the enforcer holds its spawn box,
@@ -1214,7 +1218,7 @@ static void ghostWindows(
             // driven set.
             g_roomBoxes[info.id] =
                 CBox{CX - mon->m_position.x, CY - mon->m_position.y,
-                     kSpawnWidth, kSpawnHeight};
+                     g_cfgSpawnWidth, g_cfgSpawnHeight};
             g_boxDriven.insert(info.id);
         }
 
@@ -3416,20 +3420,20 @@ static void enter3D() {
             if (const auto FSW =
                     Fullscreen::controller()->getFullscreenWindow(MON)) {
                 const double PX =
-                    MON->m_size.x * 0.5 - kSpawnWidth * 0.5;
+                    MON->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
                 const double PY =
-                    MON->m_size.y * 0.5 - kSpawnHeight * 0.5;
+                    MON->m_size.y * 0.5 - g_cfgSpawnHeight * 0.5;
 
                 Compat::setWindowBox(
                     FSW,
                     CBox{MON->m_position.x + PX, MON->m_position.y + PY,
-                         kSpawnWidth, kSpawnHeight});
+                         g_cfgSpawnWidth, g_cfgSpawnHeight});
 
                 // Room-driven ghost, same as the session newcomers: the
                 // enforcer holds the spawn box, the ghost-toggle fixup
                 // guards the floating flag.
                 g_roomBoxes[Compat::windowId(FSW)] =
-                    CBox{PX, PY, kSpawnWidth, kSpawnHeight};
+                    CBox{PX, PY, g_cfgSpawnWidth, g_cfgSpawnHeight};
                 g_boxDriven.insert(Compat::windowId(FSW));
 
                 g_layoutSaves.clear(); // no stale saves may survive into this session
@@ -5363,6 +5367,15 @@ static void onKeyboardKey(
 
 // --- plugin entry -----------------------------------------------------------
 
+// hypr3d.active(): true from open until close. A Lua toggle that also does
+// other things (e.g. switching to a dedicated workspace on the way in and
+// back on the way out) can tell the two states apart without tracking its
+// own state, which a config reload would lose.
+static int luaActive(lua_State* L) {
+    lua_pushboolean(L, g_active && g_transitionTarget > 0.5f);
+    return 1;
+}
+
 static int luaConfig(lua_State* L) {
     // hl.plugin.hypr3d.config({
     //     world = {
@@ -5551,6 +5564,35 @@ static int luaConfig(lua_State* L) {
         if (!SET_NUM(idx, "depth", g_cfgWindowDepth,
                      "windows.depth"))
             return luaL_error(L, "hypr3d.config: windows.depth must be a number");
+
+        // windows.spawn_size = { x = 960, y = 540 }: the logical box a
+        // window that appears while the view is open starts at.
+        {
+            lua_getfield(L, idx, "spawn_size");
+            if (!lua_isnil(L, -1)) {
+                if (!lua_istable(L, -1)) {
+                    lua_pop(L, 1);
+                    return luaL_error(
+                        L, "hypr3d.config: windows.spawn_size must be a table");
+                }
+
+                const auto AXIS = [&](const char* name, float& v) {
+                    lua_getfield(L, -1, name);
+                    if (lua_isnumber(L, -1))
+                        v = static_cast<float>(lua_tonumber(L, -1));
+                    lua_pop(L, 1);
+                };
+
+                AXIS("x", g_cfgSpawnWidth);
+                AXIS("y", g_cfgSpawnHeight);
+
+                if (g_cfgSpawnWidth < 16.0f)
+                    g_cfgSpawnWidth = 16.0f;
+                if (g_cfgSpawnHeight < 16.0f)
+                    g_cfgSpawnHeight = 16.0f;
+            }
+            lua_pop(L, 1);
+        }
 
         // Thickness is a distance: 0 (the default) draws the flat quads,
         // anything below is clamped up to it.
@@ -6062,6 +6104,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "active", luaActive))
+        throw std::runtime_error("[hypr3d] failed to register Lua active");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");
