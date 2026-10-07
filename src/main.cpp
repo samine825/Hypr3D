@@ -2829,9 +2829,27 @@ static void beginExit3D() {
 
     resetPointerGesture();
 
-    // No morph through fullscreen passthrough phases: the legacy fade runs.
     const auto MON = targetMonitor();
 
+    // The room dormant behind a 2D fullscreen (the passthrough handed the
+    // screen over): the desktop is already showing, there is nothing to
+    // animate -- drop the passthrough bookkeeping and tear down at once.
+    // Without this a toggle in that state bailed here and the room stayed
+    // open forever (active() true while looking at the 2D desktop).
+    if (g_fsPhase == EFullscreenPhase::In2D) {
+        g_fsWindow         = {}; // the window keeps its honest 2D fullscreen:
+                                 // deactivate must not shrink it back
+        g_fsPhase          = EFullscreenPhase::None;
+        g_fsWasOn          = false;
+        g_transition       = 0.0f;
+        g_transitionTarget = 0.0f;
+        g_viewMorph        = EViewMorph::None;
+        g_viewMorphWins.clear();
+        requestDeactivate3D();
+        return;
+    }
+
+    // No morph through the animated passthrough phases: the legacy fade runs.
     if (g_fsPhase != EFullscreenPhase::None || !MON)
         return;
 
