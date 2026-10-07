@@ -1075,6 +1075,15 @@ void CPlayerModel::destroy() {
     m_loaded = false;
     m_time = 0.f;
     m_state = EState::Idle;
+    m_prevState = EState::Idle;
+    m_blend = 1.f;
+    // The clip assignments belong to the model they were made for. Kept,
+    // a reload evaluated its "rest" pose with the old idle clip applied,
+    // the skin test in load() saw a non-identity bind, and the skin got
+    // the mesh world twice (membranes between the bones after a config
+    // reload).
+    for (auto& A : m_animFor)
+        A = -1;
     m_path.clear();
 }
 
