@@ -1211,6 +1211,9 @@ static bool ownsInput() {
 
 // Defined with the lifecycle code; the frame pump ends 3D on a session lock.
 static void requestDeactivate3D();
+
+// Defined with the Lua bindings; fires the user's on_state callback.
+static void fireOnState(bool open);
 // Window (typing) mode frees the pointer: the camera freezes, the real cursor
 // comes back and can leave for the other monitors. Space mode captures it
 // again behind the crosshair.
@@ -3437,6 +3440,8 @@ static void deactivate3D() {
     g_renderedOnce = false;
 
     notify("[hypr3d] room closed", CHyprColor{0.4f, 0.6f, 0.9f, 1.0f});
+
+    fireOnState(false);
 }
 
 // The close transition finishes inside render.stage, i.e. between the frame's
@@ -3639,6 +3644,8 @@ static void enter3D() {
     g_captureFrames = 0;
     g_reportedFramebufferError = false;
     g_reportedRenderError = false;
+
+    fireOnState(true);
 
     // The first full live capture is performed from render.pre, where
     // Hyprland has not entered its main render pass yet.
@@ -6107,7 +6114,56 @@ static int luaActive(lua_State* L) {
     return 1;
 }
 
+// The config's Lua state + the user's on_state callback (see luaOnState).
+// The state pointer is refreshed by every Lua callback: a config reload
+// recreates the state, and the registry ref only makes sense on its own.
+static lua_State* g_luaState    = nullptr;
+static int        g_onStateRef  = LUA_NOREF;
+
+// Fires the user's on_state callback (open = entered/left the room). Never
+// throws into the compositor: a broken user callback is contained by pcall.
+static void fireOnState(bool open) {
+    if (!g_luaState || g_onStateRef == LUA_NOREF)
+        return;
+
+    lua_rawgeti(g_luaState, LUA_REGISTRYINDEX, g_onStateRef);
+
+    if (!lua_isfunction(g_luaState, -1)) {
+        lua_pop(g_luaState, 1);
+        return;
+    }
+
+    lua_pushboolean(g_luaState, open);
+
+    if (lua_pcall(g_luaState, 1, 0, 0) != LUA_OK)
+        lua_pop(g_luaState, 1); // the error object; the message was on top
+}
+
+static int luaOnState(lua_State* L) {
+    if (!lua_isfunction(L, 1))
+        return luaL_error(L, "hypr3d.on_state expects a function");
+
+    // The room may already be open (the callback registered mid-session):
+    // deliver the current state once, through a COPY of the function -- the
+    // original stays on the stack for the registry ref below. pcall: an
+    // error inside the user's handler must not abort the config.
+    lua_pushvalue(L, 1);
+    lua_pushboolean(L, g_active && g_transitionTarget > 0.5f);
+
+    if (lua_pcall(L, 1, 0, 0) != LUA_OK)
+        lua_pop(L, 1); // drop the error object
+
+    if (g_onStateRef != LUA_NOREF)
+        luaL_unref(L, LUA_REGISTRYINDEX, g_onStateRef);
+
+    g_luaState   = L;
+    g_onStateRef = luaL_ref(L, LUA_REGISTRYINDEX); // pops the function
+
+    return 0;
+}
+
 static int luaConfig(lua_State* L) {
+    g_luaState = L; // a reload may have recreated the state
     // hl.plugin.hypr3d.config({
     //     world = {
     //         panorama = "~/picture.png",   -- 360-degree room background
@@ -6882,6 +6938,9 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "active", luaActive))
         throw std::runtime_error("[hypr3d] failed to register Lua active");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "on_state", luaOnState))
+        throw std::runtime_error("[hypr3d] failed to register Lua on_state");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "config", luaConfig))
         throw std::runtime_error("[hypr3d] failed to register Lua config");
