@@ -1496,7 +1496,13 @@ static void refreshCaptures(
     // lands the exact final boxes.
     static size_t    morphCaptureCursor = 0;
     constexpr size_t MORPH_RETAKE_BUDGET = 2;
-    const bool       MORPHING = g_viewMorph != EViewMorph::None;
+    // The fullscreen passthrough counts too: its window's real box changes
+    // every frame and every other window's alpha channels are in flight --
+    // ungated retakes cratered the FS flight the same way they cratered the
+    // view morph.
+    const bool       MORPHING = g_viewMorph != EViewMorph::None ||
+        g_fsPhase == EFullscreenPhase::To2D ||
+        g_fsPhase == EFullscreenPhase::To3D;
 
     bool consumedSkirt = false;
 
@@ -1690,6 +1696,8 @@ static void updateAimFocus(float dt) {
 
 // Raw (pre-smoothstep) fullscreen transition progress. Shared so syncWorld
 // and applyFullscreenAnimation agree on the same instant.
+static float smoothstep01(float x);
+
 static float fsRawProgress() {
     return std::clamp(
         std::chrono::duration<float>(std::chrono::steady_clock::now() -
@@ -2595,6 +2603,15 @@ static void applyFullscreenAnimation() {
     else
         E->roll = g_fsRollAtStart + (g_fsSavedRoll - g_fsRollAtStart) * p;
 
+    // The environment (map, grid, panorama) rides the view morph's feel,
+    // shifted late: the flight runs first against the still-standing room
+    // and the fade only becomes visible in the back half. In the view morph
+    // the flying quads cover the desktop, so the reveal reads as coming
+    // after the flight; a front-loaded fade here exposed it immediately.
+    const float ENVP =
+        smoothstep01(std::clamp((RAWP - 0.5f) / 0.5f, 0.0f, 1.0f));
+    g_scene.setEnvAlpha(A ? 1.0f - ENVP : ENVP);
+
     // The REAL box animates between the floating box and the fullscreen box.
     // The client's buffer is stretched to this box by the compositor, so the
     // content scale inside the quad stays constant through the whole
@@ -3029,7 +3046,11 @@ static void applyViewMorphWindows(const PHLMONITOR& mon, float s) {
 static void applyViewMorph(const PHLMONITOR& mon) {
     if (g_viewMorph == EViewMorph::None) {
         g_morphS = 1.0f;
-        g_scene.setEnvAlpha(1.0f);
+        // A fullscreen phase owns the environment fade while it runs (see
+        // applyFullscreenAnimation, which runs earlier in the frame); don't
+        // stomp it back to 1.
+        if (g_fsPhase == EFullscreenPhase::None)
+            g_scene.setEnvAlpha(1.0f);
         return;
     }
 
@@ -3039,7 +3060,6 @@ static void applyViewMorph(const PHLMONITOR& mon) {
         const float S_END = g_viewMorph == EViewMorph::To3D ? 1.0f : 0.0f;
 
         g_morphS = S_END;
-        g_scene.setEnvAlpha(S_END);
         applyViewMorphWindows(mon, S_END);
 
         g_viewMorph = EViewMorph::None;
@@ -6365,6 +6385,11 @@ static int luaConfig(lua_State* L) {
                         L, "hypr3d.config: windows.spawn_size must be a table");
                 }
 
+                // Both { x = 960, y = 540 } and { 960, 540 } work; positional
+                // wins when both forms are mixed in one table.
+                float x = g_cfgSpawnWidth, y = g_cfgSpawnHeight;
+                bool  havePos = false;
+
                 const auto AXIS = [&](const char* name, float& v) {
                     lua_getfield(L, -1, name);
                     if (lua_isnumber(L, -1))
@@ -6372,8 +6397,20 @@ static int luaConfig(lua_State* L) {
                     lua_pop(L, 1);
                 };
 
-                AXIS("x", g_cfgSpawnWidth);
-                AXIS("y", g_cfgSpawnHeight);
+                AXIS("x", x);
+                AXIS("y", y);
+
+                for (int k = 1; k <= 2; ++k) {
+                    lua_geti(L, -1, k);
+                    if (lua_isnumber(L, -1)) {
+                        (k == 1 ? x : y) = static_cast<float>(lua_tonumber(L, -1));
+                        havePos = true;
+                    }
+                    lua_pop(L, 1);
+                }
+
+                g_cfgSpawnWidth  = x;
+                g_cfgSpawnHeight = y;
 
                 if (g_cfgSpawnWidth < 16.0f)
                     g_cfgSpawnWidth = 16.0f;
