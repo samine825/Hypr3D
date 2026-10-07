@@ -18,7 +18,7 @@ A Hyprland plugin that turns your workspace into a walkable 3D space
 ```bash
 # Install latest
 hyprpm add https://github.com/samine825/Hypr3D
-hyprpm enable Hypr3D
+hyprpm enable hypr3d
 
 # Update
 hyprpm update
