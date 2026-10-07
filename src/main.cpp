@@ -3435,6 +3435,8 @@ static void deactivate3D() {
 
     unghostWindows();
     g_renderedOnce = false;
+
+    notify("[hypr3d] room closed", CHyprColor{0.4f, 0.6f, 0.9f, 1.0f});
 }
 
 // The close transition finishes inside render.stage, i.e. between the frame's
