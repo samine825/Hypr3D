@@ -119,15 +119,25 @@ struct SBspNode {
 };
 
 static void bspBuild(SBspNode& node, std::vector<SWPoly>& polys, int depth) {
+    // A split can leave slivers with fewer than three vertices: nothing to
+    // draw, and no plane to take (reading verts[2] of one crashed).
+    std::erase_if(polys, [](const SWPoly& p) { return p.verts.size() < 3; });
     if (polys.empty())
         return;
 
-    // Node plane from the first polygon.
+    // Node plane from the first polygon with a usable one.
     const Vec3 A = polys[0].verts[0].p;
     const Vec3 B = polys[0].verts[1].p;
     const Vec3 C = polys[0].verts[2].p;
+    const Vec3 CR = cross(B - A, C - A);
+    if (!(dot(CR, CR) > 1e-12f)) {
+        // Degenerate (collinear) first polygon: no splitting plane here.
+        for (auto& P : polys)
+            node.coplanar.push_back(std::move(P));
+        return;
+    }
     node.p = A;
-    node.n = normalize(cross(B - A, C - A));
+    node.n = normalize(CR);
 
     std::vector<SWPoly> frontList, backList;
 
