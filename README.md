@@ -163,14 +163,19 @@ end
 
 ## Lua API
 
-| Function                           | Description                                       |
-| ------------------------------------| ---------------------------------------------------|
-| `hypr3d.toggle()`                  | open the room if closed, close it if open         |
-| `hypr3d.open()` / `hypr3d.close()` | explicit open / close                             |
-| `hypr3d.active()`                  | `true` while the 3D room is open                  |
-| `hypr3d.first_person_body([on])`  | set the first-person body (no argument toggles it) |
-| `hypr3d.on_state(fn)`              | call `fn(open)` whenever the room opens or closes |
-| `hypr3d.config({params})`          | see [Config parameters](#config-parameters)       |
+| Function                           | Description                                        |
+| ---------------------------------- | ---------------------------------------------------|
+| `hypr3d.toggle()`                  | open the room if closed, close it if open          |
+| `hypr3d.open()` / `hypr3d.close()` | explicit open / close                              |
+| `hypr3d.active()`                  | `true` while the 3D room is open                   |
+| `hypr3d.first_person_body([on])`   | set the first-person body (no argument toggles it) |
+| `hypr3d.lights([level \| on])`     | room light level 0..1 (no argument toggles)        |
+| `hypr3d.power(group, [on])`        | switch a power group on/off (no argument toggles)  |
+| `hypr3d.gesture(name)`             | play a player clip once over the current animation |
+| `hypr3d.sit([on])`                 | sit in `player.seat` (no argument sits down)       |
+| `hypr3d.toggle_flight()`           | disables flight when enabled, enables it otherwise |
+| `hypr3d.on_state(fn)`              | call `fn(open)` whenever the room opens or closes  |
+| `hypr3d.config({params})`          | see [Config parameters](#config-parameters)        |
 
 ## <a name="config-parameters"></a> Config parameters
 
