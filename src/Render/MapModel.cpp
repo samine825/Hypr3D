@@ -85,6 +85,8 @@ uniform float uEmissiveStrength;
 uniform int uFlat;   // baked-map mode: albedo/emission as-is, no dynamic light
 uniform int uAlphaMode;      // 0 opaque, 1 mask, 2 blend (glTF alphaMode)
 uniform float uAlphaCutoff;  // mask cutoff
+uniform float uLight;        // room light level (1 = as authored)
+uniform float uPower;        // power group level: emission and haze
 
 out vec4 fragColor;
 
@@ -111,12 +113,15 @@ void main() {
             float ea = uColor.a * texture(uEmissive, vUV).a;
             if (uAlphaMode == 1 && ea < uAlphaCutoff)
                 discard;
-            fragColor = vec4(e, uAlphaMode == 0 ? 1.0 : ea);
+            fragColor = vec4(e * uPower, uAlphaMode == 0 ? 1.0 : ea);
         } else {
             if (uAlphaMode == 1 && alpha < uAlphaCutoff)
                 discard;
             fragColor = vec4(base, alpha);
         }
+        fragColor.rgb *= uLight;
+        if (uAlphaMode == 2)
+            fragColor.a *= uLight * uPower;
         return;
     }
 
@@ -134,12 +139,15 @@ void main() {
         float ea = uColor.a;
         if (uAlphaMode == 1 && ea < uAlphaCutoff)
             discard;
-        fragColor = vec4(emissive, uAlphaMode == 0 ? 1.0 : ea);
+        fragColor = vec4(emissive * uPower, uAlphaMode == 0 ? 1.0 : ea);
     } else {
         if (uAlphaMode == 1 && alpha < uAlphaCutoff)
             discard;
         fragColor = vec4(base * mix(vec3(0.6), vec3(1.0), wrap), alpha);
     }
+    fragColor.rgb *= uLight;
+    if (uAlphaMode == 2)
+        fragColor.a *= uLight * uPower;
 }
 )GLSL";
 
@@ -396,6 +404,8 @@ CMapModel::decode(const std::string& path, std::stop_token stop) {
             SPrimitive&     out = out_.params;
 
             if (prim->material) {
+                if (prim->material->name)
+                    out.material = prim->material->name;
                 // glTF alpha pipeline.
                 out.alphaMode = static_cast<int>(prim->material->alpha_mode);
                 out.alphaCutoff = prim->material->alpha_cutoff > 0.f ?
@@ -653,6 +663,8 @@ void CMapModel::finishUpload() {
                 m_uEmissiveFactor   = glGetUniformLocation(P, "uEmissiveFactor");
                 m_uEmissiveStrength = glGetUniformLocation(P, "uEmissiveStrength");
                 m_uFlat             = glGetUniformLocation(P, "uFlat");
+                m_uLight            = glGetUniformLocation(P, "uLight");
+                m_uPower            = glGetUniformLocation(P, "uPower");
                 m_uAlphaMode        = glGetUniformLocation(P, "uAlphaMode");
                 m_uAlphaCutoff      = glGetUniformLocation(P, "uAlphaCutoff");
             }
@@ -975,6 +987,8 @@ void CMapModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     glUniform1i(m_uTex, 0);
     glUniform1i(m_uEmissive, 1);
     glUniform1i(m_uFlat, m_flat ? 1 : 0);
+    const float LIGHT = lightLevel();
+    glUniform1f(m_uLight, LIGHT);
 
     glEnable(GL_DEPTH_TEST);
 
@@ -984,12 +998,25 @@ void CMapModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
         glUniform4f(m_uColor, P.color[0], P.color[1], P.color[2], P.color[3]);
         glUniform1i(m_uAlphaMode, P.alphaMode);
         glUniform1f(m_uAlphaCutoff, P.alphaCutoff);
+        const float POWER = powerLevel(P.material);
+        glUniform1f(m_uPower, POWER < 0.0f ? 1.0f : POWER);
 
         const bool HAS_EMISSIVE =
             P.emissiveTex != 0 &&
             (P.emissiveFactor[0] > 0.f || P.emissiveFactor[1] > 0.f ||
              P.emissiveFactor[2] > 0.f);
         glUniform1i(m_uHasEmissive, HAS_EMISSIVE ? 1 : 0);
+        // Screens ignore the room light: every emissive part with
+        // screens = true (only the power_materials ones when listed), and
+        // any part named in screen_materials (a screen's light spill).
+        const bool SCREEN =
+            (m_screens && HAS_EMISSIVE &&
+             (m_powerMaterials.empty() ||
+              std::find(m_powerMaterials.begin(), m_powerMaterials.end(),
+                        P.material) != m_powerMaterials.end())) ||
+            std::find(m_screenMaterials.begin(), m_screenMaterials.end(),
+                      P.material) != m_screenMaterials.end();
+        glUniform1f(m_uLight, SCREEN ? 1.0f : LIGHT);
         glUniform3f(m_uEmissiveFactor, P.emissiveFactor[0], P.emissiveFactor[1],
                     P.emissiveFactor[2]);
         glUniform1f(m_uEmissiveStrength, P.emissiveStrength * m_emissiveScale);

@@ -188,7 +188,7 @@ Everything is optional -- only set what you want to change.
 
 | Option         | Type               | Default    | Description                              |
 | ----------------| --------------------| ------------| ------------------------------------------|
-| window_scale   | float              | 0.5        | window size multiplier (at 100 px/m)     |
+| window_scale   | float              | 0.08       | window size multiplier (at 100 px/m)     |
 | spawn_distance | float              | 5.0        | how far from you new windows appear (m)  |
 | depth          | float              | 0.05       | window slab thickness (0 = flat quads)   |
 | spawn_size     | [Vector2](#vector) | {960, 540} | size of windows spawned while 3D is open |

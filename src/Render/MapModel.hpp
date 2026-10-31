@@ -2,12 +2,14 @@
 
 #include "World/Camera.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdint>
 #include <memory>
 #include <stop_token>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace H3D {
@@ -62,6 +64,64 @@ class CMapModel {
     // The rotation pivot: Logical = the mesh's local AABB center, Origin =
     // the mesh's own origin. centerOffset adds on top in local units.
     void setCenter(ECenter mode, const Vec3& offset);
+
+    // Room light level shared by every scene model (1 = as authored, 0 =
+    // black); self-lit models (screens, neon, glow quads) ignore it.
+    static inline float s_lightLevel = 1.0f;
+    static inline float s_darkLevel  = 0.15f; // the level "lights off" fades to
+    void setSelfLit(bool on) {
+        m_selfLit = on;
+    }
+    // This model's own lights-off level (< 0 = follow the room): a neon tube
+    // can stay visibly coloured while the room goes black, a glow quad can
+    // vanish (blended materials fade their alpha with the level too).
+    void setDarkLevel(float d) {
+        m_darkLevel = d;
+    }
+    // Power groups (hypr3d.power): an off group blacks out the emissive
+    // output (screens, lamps) and fades the blended haze of this model's
+    // primitives -- all of them, or only those whose material is listed.
+    // Lit surfaces keep following the room light.
+    static inline std::unordered_map<std::string, float> s_power; // group -> 0..1
+    // Screens: emissive primitives (only power_materials ones when listed)
+    // ignore the room light -- they go dark only through their power group.
+    void setScreens(bool on, std::vector<std::string> materials = {}) {
+        m_screens         = on;
+        m_screenMaterials = std::move(materials);
+    }
+    // groups: each group with the materials it covers (empty = all, or the
+    // shared power_materials list when set).
+    using PowerList = std::vector<std::pair<std::string, std::vector<std::string>>>;
+    void setPower(PowerList groups, std::vector<std::string> materials) {
+        m_powerGroups    = std::move(groups);
+        m_powerMaterials = std::move(materials);
+    }
+    // 1 = on; the lowest level of the groups covering this material, or -1
+    // when no group covers it.
+    float powerLevel(const std::string& material) const {
+        float p = -1.0f;
+        for (const auto& [G, MATS] : m_powerGroups) {
+            const auto& LIST = MATS.empty() ? m_powerMaterials : MATS;
+            if (!LIST.empty() && std::find(LIST.begin(), LIST.end(), material) == LIST.end())
+                continue;
+            const auto IT = s_power.find(G);
+            const float L = IT != s_power.end() ? IT->second : 1.0f;
+            p = p < 0.0f ? L : std::min(p, L);
+        }
+        return p;
+    }
+
+    float lightLevel() const {
+        if (m_selfLit)
+            return 1.0f;
+        if (m_darkLevel < 0.0f)
+            return s_lightLevel;
+        const float SPAN = 1.0f - s_darkLevel;
+        const float T = SPAN > 1e-4f ? (s_lightLevel - s_darkLevel) / SPAN
+                                     : (s_lightLevel >= 1.0f ? 1.0f : 0.0f);
+        const float C = T < 0.0f ? 0.0f : (T > 1.0f ? 1.0f : T);
+        return m_darkLevel + (1.0f - m_darkLevel) * C;
+    }
 
     // Global emissive multiplier (config); 0 = pure lambert, 1 = as authored.
     void setEmissiveScale(float s) {
@@ -155,6 +215,7 @@ class CMapModel {
         int          alphaMode = 0;
         float        alphaCutoff = 0.5f;
         Vec3         centroid{}; // node-space AABB center, for blend sorting
+        std::string  material;   // glTF material name (power_materials)
     };
 
     // The file's meshes and images, read and decoded without GL.
@@ -203,6 +264,13 @@ class CMapModel {
     int                     m_uEmissiveFactor = -1;
     int                     m_uEmissiveStrength = -1;
     int                     m_uFlat = -1;
+    int                     m_uLight = -1;
+    bool                    m_selfLit = false;
+    float                   m_darkLevel = -1.0f;
+    PowerList               m_powerGroups;
+    std::vector<std::string> m_powerMaterials, m_screenMaterials;
+    bool                    m_screens = false;
+    int                     m_uPower = -1;
     int                     m_uAlphaMode = -1;
     int                     m_uAlphaCutoff = -1;
 

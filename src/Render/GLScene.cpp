@@ -1269,6 +1269,10 @@ void GLScene::setSceneObjects(const std::vector<SSceneSpec>& specs) {
 
         S.model->setEmissiveScale(S.spec.emissiveScale);
         S.model->setFlat(S.spec.flat);
+        S.model->setSelfLit(S.spec.selfLit);
+        S.model->setDarkLevel(S.spec.darkLevel);
+        S.model->setPower(S.spec.power, S.spec.powerMaterials);
+        S.model->setScreens(S.spec.screens, S.spec.screenMaterials);
 
         if (CENTER_CHANGED)
             S.model->setCenter(S.spec.center, S.spec.centerOffset);
@@ -2524,6 +2528,7 @@ bool GLScene::render(
                          m_playerCfg.posOffset + m_playerCfg.centerOffset,
                          m_playerCfg.rotDeg);
         m_player.setFlat(m_playerCfg.flat);
+        m_player.setScreenMaterials(m_playerCfg.screenMaterials);
         m_player.setEmissiveScale(m_playerCfg.emissiveScale);
         m_player.update(dt);
         m_player.draw(vp, m_camera.position);

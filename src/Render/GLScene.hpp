@@ -176,6 +176,7 @@ class GLScene {
         Vec3        scale{1.f, 1.f, 1.f};
         float       emissiveScale = 1.0f;
         bool        flat = false;  // true: raw texture, no headlight shading
+        std::vector<std::string> screenMaterials; // ignore the room light
         std::string center;       // parsed for format parity; the player
         Vec3        centerOffset{}; // rotates around its anchor, so only
                                   // center_offset (the anchor shift) applies
@@ -200,6 +201,11 @@ class GLScene {
         m_playerVisible = on;
     }
 
+    // First-person body: draw the character headless under the eye.
+    void setPlayerHeadless(bool on) {
+        m_player.setHideHead(on);
+    }
+
     CPlayerModel* player() {
         return &m_player;
     }
@@ -216,6 +222,11 @@ class GLScene {
         Vec3 position{}, rotationDeg{}, scale{1.0f, 1.0f, 1.0f};
         float emissiveScale = 1.0f;
         bool flat = false; // false = headlight half-lambert shading
+        bool selfLit = false; // ignores the room light level
+        float darkLevel = -1.0f; // own lights-off level, < 0 = the room's
+        CMapModel::PowerList power; // hypr3d.power groups (+ their materials)
+        std::vector<std::string> powerMaterials, screenMaterials;
+        bool screens = false; // emissive parts ignore the room light
         CMapModel::ECenter center = CMapModel::ECenter::Logical;
         Vec3 centerOffset{};
     };

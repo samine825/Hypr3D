@@ -26,7 +26,10 @@
 #include <hyprland/src/render/pass/PassElement.hpp>
 #include <hyprland/src/render/gl/GLFramebuffer.hpp>
 #include <hyprland/src/output/Monitor.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
+#include <hyprland/src/desktop/view/window/WindowPresentation.hpp>
+#include <hyprland/src/desktop/view/window/WindowBackend.hpp>
+#include <hyprland/src/layout/target/WindowTarget.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/managers/eventLoop/EventLoopManager.hpp>
 #include <hyprland/src/managers/fullscreen/FullscreenController.hpp>
@@ -439,7 +442,22 @@ static bool        g_cfgGrid = true;
 static bool        g_cfgUnderLayers = true;
 
 // --- windows ----------------------------------------------------------------
-static float       g_cfgWindowScale   = 0.5f;    // room multiplier on window size
+static float       g_cfgWindowScale   = 0.08f;   // room multiplier on window size
+static float       g_cfgDarkLevel     = 0.15f;   // room light level with the lights off
+static float       g_lightTarget      = 1.0f;    // hypr3d.lights(): where the level fades to
+// player.seat: a chair the player can sit in (hypr3d.sit(), and on entering 3D)
+struct SSeatCfg {
+    bool  valid = false;
+    float x = 0.f, y = 0.5f, z = 0.f; // seat surface centre (y = its height)
+    float yawDeg = 0.f;               // facing (camera yaw convention)
+    float eye = 0.75f;                // eye height above the seat surface
+    float hip = 0.9f;                 // the character's standing hip height
+    bool  onEnter = true;             // entering 3D starts seated
+    std::string pose = "Sit";         // the character's held seated clip
+};
+static SSeatCfg g_seat;
+static bool     g_seated = false;
+static std::unordered_map<std::string, float> g_powerTarget; // hypr3d.power(): group -> 0/1
 static float       g_cfgSpawnDistance = 5.0f;    // units in front of the camera
 static float       g_cfgWindowDepth   = 0.05f;   // slab thickness, 0 = flat quads
 
@@ -452,6 +470,8 @@ static bool        g_playerFlying     = true;    // false = walk / jump / gravit
 static bool        g_playerCollision  = true;    // reserved: the capsule is
         // the movement system, so this only gates future per-object contact
 static bool        g_cfgWalkBob       = true;    // view-only walk bob (walking only)
+static bool        g_cfgFpBody        = false;   // draw the character in first person (headless)
+static float       g_cfgFpBodyBack    = 0.2f;    // first-person body: metres behind the eye
 static GLScene::SPlayerCfg g_playerCfg;          // the player character
 static float        g_playerAnimSpeed[4] = {1.f, 1.f, 1.f, 1.f};
 
@@ -482,6 +502,11 @@ struct SSceneObjectCfg {
     bool        collision = true;
     bool        dynamic = false; // static = false -> grabbable with Super+LMB
     bool        physics = false; // gravity + world collisions (dynamic only)
+    bool        selfLit = false; // keeps glowing when the room lights go down
+    float       darkLevel = -1.0f; // own lights-off level (< 0 = world.dark_level)
+    CMapModel::PowerList power; // hypr3d.power groups (+ their materials)
+    std::vector<std::string> powerMaterials, screenMaterials;
+    bool        screens = false; // emissive parts ignore the room light
     CMapModel::ECenter center = CMapModel::ECenter::Logical;
     Vec3        centerOffset{}; // extra pivot shift, local units
 };
@@ -1337,7 +1362,7 @@ static void ghostWindows(
         // coordinates: centre on this monitor, not on the layout origin
         // (which belongs to whichever monitor sits at 0,0, or none at all).
         // A dialog (a window with a parent) keeps the size it asked for.
-        if (info.window && !info.window->parent()) {
+        if (info.window && !info.window->backend().parent()) {
             const double CX =
                 mon->m_position.x + mon->m_size.x * 0.5 - g_cfgSpawnWidth * 0.5;
             const double CY =
@@ -1390,9 +1415,9 @@ static void unghostWindows() {
         // screen; a pre-existing tiled window must return to its tile.
         // User-initiated floats during the session are not in the set.
         if (g_flagFloated.count(save.id) && !save.wasFloating)
-            if (auto W = save.window.lock(); W && W->m_target &&
-                                             W->m_target->floating())
-                W->m_target->setFloating(false);
+            if (auto W = save.window.lock(); W && W->windowTarget() &&
+                                             W->windowTarget()->floating())
+                W->windowTarget()->setFloating(false);
     }
 
     Compat::restoreWindowLayoutSettle(g_layoutSaves);
@@ -1532,13 +1557,13 @@ static void refreshCaptures(
         const auto NOW = std::chrono::steady_clock::now();
 
         const bool FADING = info.window &&
-            (info.window->alpha(Desktop::View::WINDOW_ALPHA_ACTIVE)
+            (info.window->presentation().alpha(Desktop::View::WINDOW_ALPHA_ACTIVE)
                  ->isBeingAnimated() ||
-                info.window->alpha(Desktop::View::WINDOW_ALPHA_FADE)
+                info.window->presentation().alpha(Desktop::View::WINDOW_ALPHA_FADE)
                  ->isBeingAnimated() ||
-                info.window->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN)
-                 ->isBeingAnimated() ||
-                info.window->m_borderFadeAnimationProgress->isBeingAnimated());
+                info.window->presentation().alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN)
+                 ->isBeingAnimated());
+        // (0.57 no longer exposes the border fade progress on the window.)
 
         if (FADING)
             alphaGrace[info.id] = NOW + std::chrono::milliseconds(200);
@@ -1828,7 +1853,7 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
         // the primary source lives in the capture layer.
         if (!info.isLayer && info.window) {
             const float R = std::max(
-                0.0f, info.window->rounding() +
+                0.0f, info.window->presentation().rounding() +
                           static_cast<float>(SNAPSHOT->surfaceOffset.x));
 
             auto& C = g_winOutlines[info.id];
@@ -1917,10 +1942,10 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             entity.pitch  = POSE->second.pitch;
             entity.roll   = POSE->second.roll;
         }
-        else if (info.window && info.window->parent() &&
-                 !g_world.find(Compat::windowId(info.window->parent())) &&
+        else if (info.window && info.window->backend().parent() &&
+                 !g_world.find(Compat::windowId(info.window->backend().parent())) &&
                  std::any_of(INFOS.begin(), INFOS.end(), [&](const auto& I) {
-                     return I.id == Compat::windowId(info.window->parent());
+                     return I.id == Compat::windowId(info.window->backend().parent());
                  })) {
             // Its parent is new to the room too (both mapped this frame):
             // wait a frame for the parent's pose instead of spawning at the
@@ -1928,8 +1953,8 @@ static void syncWorld(const PHLMONITOR& mon, float dt) {
             continue;
         }
         else if (const auto* DIALOG_PARENT =
-                     info.window && info.window->parent()
-                         ? g_world.find(Compat::windowId(info.window->parent()))
+                     info.window && info.window->backend().parent()
+                         ? g_world.find(Compat::windowId(info.window->backend().parent()))
                          : nullptr) {
             // A dialog (file chooser, preferences) opens just in front of the
             // window that asked for it, facing the same way.
@@ -2355,8 +2380,8 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
         CBox       RESTORE = IT != g_fsStableBoxes.end() ?
             IT->second : Compat::currentWindowBox(window);
 
-        if (IT == g_fsStableBoxes.end() && window->m_target) {
-            const auto LF = window->m_target->lastFloatingSize();
+        if (IT == g_fsStableBoxes.end() && window->windowTarget()) {
+            const auto LF = window->windowTarget()->lastFloatingSize();
 
             if (LF.x > 5.0 && LF.y > 5.0)
                 RESTORE = CBox{RESTORE.x, RESTORE.y, LF.x, LF.y};
@@ -2374,8 +2399,8 @@ static void startTo2D(const PHLWINDOW& window, bool captureRestoreBox) {
     // the transition's per-frame setWindowBox calls would otherwise
     // re-member intermediate (up to monitor-sized) values, and Hyprland's
     // own FS-exit applies that memory.
-    if (window->m_target)
-        window->m_target->rememberFloatingSize(
+    if (window->windowTarget())
+        window->windowTarget()->rememberFloatingSize(
             {g_fsRestoreBox.w, g_fsRestoreBox.h});
 
     // The screen-covering distance derives from the vertical FOV and the
@@ -2465,7 +2490,7 @@ static void damageWindowsWithLiveAlpha(const PHLMONITOR& mon) {
             continue;
 
         const auto IN_FLIGHT = [&](Desktop::View::eWindowAlpha channel) {
-            return W->alphaValue(channel) != W->alphaGoal(channel);
+            return W->presentation().alphaValue(channel) != W->presentation().alphaGoal(channel);
         };
 
         if (IN_FLIGHT(Desktop::View::WINDOW_ALPHA_FADE) ||
@@ -2680,7 +2705,7 @@ static void applyFullscreenAnimation() {
             // Hyprland's remembered floating size with intermediate (up to
             // monitor-sized) values. Re-pin the captured PRE-FS size.
             if (auto W2 = g_fsWindow.lock())
-                W2->m_target->rememberFloatingSize(
+                W2->windowTarget()->rememberFloatingSize(
                     {g_fsRestoreBox.w, g_fsRestoreBox.h});
 
             if (Compat::setCursorHidden(false) && g_pHyprRenderer)
@@ -2725,8 +2750,8 @@ static void applyFullscreenAnimation() {
                              Desktop::windowState()->windows()) {
                             if (W3 && W3->m_workspace ==
                                           MON->m_activeWorkspace &&
-                                !W3->m_pinned)
-                                *W3->alpha(
+                                !bool(W3->m_state & Desktop::View::WINDOW_STATE_PINNED))
+                                *W3->presentation().alpha(
                                      Desktop::View::WINDOW_ALPHA_FULLSCREEN) =
                                     1.F;
                         }
@@ -3595,12 +3620,24 @@ static void enter3D() {
 
     resetMovementKeys();
 
+    // player.seat.on_enter: every 3D session starts seated in the chair.
+    if (g_seat.valid && g_seat.onEnter) {
+        g_seated = true;
+        auto& SCAM = g_scene.camera();
+        SCAM.yaw      = g_seat.yawDeg * 3.14159265f / 180.f;
+        SCAM.pitch    = 0.f;
+        SCAM.position = Vec3{g_seat.x, g_seat.y + g_seat.eye, g_seat.z};
+        if (g_scene.player())
+            g_scene.player()->setHold(g_seat.pose);
+    }
+
     g_grounded = false;
     // The camera mode (F5: first person / third behind / third front) rides
     // the same cross-session memory as the camera pose.
     g_viewMode = g_savedCamValid ? g_savedViewMode : 0;
     g_scene.camera().mirrorView = g_viewMode == 2;
-    g_scene.setPlayerVisible(g_viewMode != 0);
+    g_scene.setPlayerVisible(g_viewMode != 0 || g_cfgFpBody);
+    g_scene.setPlayerHeadless(g_viewMode == 0 && g_cfgFpBody);
     g_scene.setPlayerDebugCapsule(Vec3{}, false);
 
     g_keyboardMode = EKeyboardMode::Space;
@@ -3823,6 +3860,17 @@ static void applyCameraMovement(float dt) {
 }
 
 static void update3D(float dt) {
+    // Room lights: fade the shared level toward hypr3d.lights()'s target.
+    {
+        float& LV = CMapModel::s_lightLevel;
+        const float STEP = std::max(dt, 0.0f) * 2.5f; // full swing in ~0.4 s
+        LV = LV < g_lightTarget ? std::min(g_lightTarget, LV + STEP)
+                                : std::max(g_lightTarget, LV - STEP);
+        for (const auto& [G, T] : g_powerTarget) {
+            float& P = CMapModel::s_power.try_emplace(G, 1.0f).first->second;
+            P = P < T ? std::min(T, P + STEP * 1.6f) : std::max(T, P - STEP * 1.6f);
+        }
+    }
     // Release capture unconditionally when the view no longer owns input, so
     // a disappearing monitor or a closing transition can never strand the
     // pointer in captured mode.
@@ -3860,6 +3908,12 @@ static void update3D(float dt) {
         SPEC.scale         = OBJ.scale;
         SPEC.emissiveScale = OBJ.emissiveScale;
         SPEC.flat          = OBJ.flat;
+        SPEC.selfLit       = OBJ.selfLit;
+        SPEC.darkLevel     = OBJ.darkLevel;
+        SPEC.power         = OBJ.power;
+        SPEC.powerMaterials = OBJ.powerMaterials;
+        SPEC.screens       = OBJ.screens;
+        SPEC.screenMaterials = OBJ.screenMaterials;
         SPEC.center        = OBJ.center;
         SPEC.centerOffset  = OBJ.centerOffset;
         SPECS.push_back(SPEC);
@@ -3948,7 +4002,8 @@ static void update3D(float dt) {
         // NOT gate this.)
         if (!g_playerBody.IsInvalid()) {
             const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
-            const Vec3 EYE{PPOS.GetX(), PPOS.GetY() + PLAYER_EYE_OFF,
+            const Vec3 EYE{PPOS.GetX(),
+                           g_seated ? g_seat.y + g_seat.eye : PPOS.GetY() + PLAYER_EYE_OFF,
                            PPOS.GetZ()};
             auto& CAM = g_scene.camera();
 
@@ -3968,9 +4023,11 @@ static void update3D(float dt) {
 
             g_grounded = playerGrounded();
 
-            // The character renders in third person only; F3 adds the
-            // capsule outline.
-            g_scene.setPlayerVisible(g_viewMode != 0);
+            // The character renders in third person, and headless in first
+            // person with player.first_person_body; F3 adds the capsule
+            // outline.
+            g_scene.setPlayerVisible(g_viewMode != 0 || g_cfgFpBody);
+            g_scene.setPlayerHeadless(g_viewMode == 0 && g_cfgFpBody);
             g_scene.setPlayerDebugCapsule(
                 Vec3{PPOS.GetX(), PPOS.GetY(), PPOS.GetZ()}, g_debugHud);
 
@@ -4072,7 +4129,27 @@ static void update3D(float dt) {
                     JPH::Quat::sIdentity(), JPH::EActivation::Activate);
         }
 
-        applyCameraMovement(dt); // -> s_moveVel
+        // Seated: any movement key stands up; until then the body stays on
+        // the seat's spot (the camera rides g_seat.eye above the seat).
+        if (g_seated && (g_keyFwd || g_keyBack || g_keyLeft || g_keyRight ||
+                         g_keyUp || g_playerJumpQueued)) {
+            g_seated = false;
+            g_playerJumpQueued = false;
+            if (g_scene.player())
+                g_scene.player()->setHold("");
+        }
+        if (g_seated) {
+            const auto CUR = g_bodyIf->GetPosition(g_playerBody);
+            g_bodyIf->SetPosition(g_playerBody,
+                                  JPH::RVec3(g_seat.x, CUR.GetY(), g_seat.z),
+                                  JPH::EActivation::Activate);
+            const auto V = g_bodyIf->GetLinearVelocity(g_playerBody);
+            g_bodyIf->SetLinearVelocity(g_playerBody, JPH::Vec3(0.f, V.GetY(), 0.f));
+            s_moveVel = Vec3{};
+            if (g_scene.player())
+                g_scene.player()->setHold(g_seat.pose); // the model may load late
+        } else
+            applyCameraMovement(dt); // -> s_moveVel
 
         // The character's facing: RY(pi - yaw) maps the authored +Z front
         // onto the look direction. Applied AFTER this frame's look update
@@ -4080,10 +4157,23 @@ static void update3D(float dt) {
         // top of the look inertia and reads as a staircase on fast turns.
         {
             const auto PPOS = g_bodyIf->GetPosition(g_playerBody);
+            // First-person body: the feet step back along the facing, so
+            // the eye sits just in front of the (hidden) face and looking
+            // down shows the chest and legs rather than their insides.
+            const float SEAT_YAW = g_seat.yawDeg * 3.14159265f / 180.f;
+            const Vec3 FACE = g_seated ? Vec3{std::sin(SEAT_YAW), 0.f, -std::cos(SEAT_YAW)}
+                                       : CAM.flatForward();
+            const Vec3 BACK = g_viewMode == 0 && g_cfgFpBody
+                ? FACE * (-g_cfgFpBodyBack)
+                : Vec3{};
+            // Seated: the hips sit on the seat (the held Sit clip folds the
+            // legs), so the model's feet anchor drops by the hip height.
             g_scene.setPlayerPose(
-                Vec3{PPOS.GetX(), PPOS.GetY() - Camera::kBodyHeight * 0.5f,
-                     PPOS.GetZ()},
-                3.14159265f - CAM.yaw);
+                Vec3{PPOS.GetX() + BACK.x,
+                     g_seated ? g_seat.y - g_seat.hip
+                              : PPOS.GetY() - Camera::kBodyHeight * 0.5f,
+                     PPOS.GetZ() + BACK.z},
+                3.14159265f - (g_seated ? SEAT_YAW : CAM.yaw));
 
             // The third-person camera SPHERICALLY orbits the player: yaw
             // sweeps the horizontal ring, pitch lifts/drops the camera
@@ -4367,10 +4457,10 @@ static void update3D(float dt) {
                     continue;
                 }
 
-                if (ID == g_fsCurrentId || !W->m_target)
+                if (ID == g_fsCurrentId || !W->windowTarget())
                     continue;
 
-                const bool FLOATING = W->m_target->floating();
+                const bool FLOATING = W->windowTarget()->floating();
 
                 if (FLOATING && !g_boxDriven.count(ID))
                     continue; // live box: client resizes stay visible
@@ -4432,7 +4522,7 @@ class CHypr3DPassElement final : public IPassElement {
     CHypr3DPassElement(float alpha, float dt) :
         m_alpha(alpha), m_dt(dt) {}
 
-    std::vector<UP<IPassElement>> draw() override {
+    std::vector<UP<IPassElement>> draw(Render::CRenderContext& ctx) override {
         const auto GATE = [&](const std::string& why) {
             g_lastRenderGate = why;
             reportFramebufferErrorOnce(why);
@@ -4445,7 +4535,7 @@ class CHypr3DPassElement final : public IPassElement {
         if (g_pHyprRenderer->type() != Render::IHyprRenderer::RT_GL)
             return GATE("[hypr3d] renderer is not OpenGL");
 
-        auto& renderData = g_pHyprRenderer->m_renderData;
+        auto& renderData = ctx.m_data;
 
         if (!renderData.currentFB)
             return GATE("[hypr3d] current framebuffer is null");
@@ -4520,11 +4610,11 @@ class CHypr3DPassElement final : public IPassElement {
         return {};
     }
 
-    bool needsLiveBlur() override {
+    bool needsLiveBlur(Render::CRenderContext&) override {
         return false;
     }
 
-    bool needsPrecomputeBlur() override {
+    bool needsPrecomputeBlur(Render::CRenderContext&) override {
         return false;
     }
 
@@ -4536,19 +4626,19 @@ class CHypr3DPassElement final : public IPassElement {
         return EK_CUSTOM;
     }
 
-    bool undiscardable() override {
+    bool undiscardable(Render::CRenderContext&) override {
         return true;
     }
 
-    bool disableSimplification() override {
+    bool disableSimplification(Render::CRenderContext&) override {
         return true;
     }
 
-    std::optional<CBox> boundingBox() override {
+    std::optional<CBox> boundingBox(Render::CRenderContext&) override {
         return std::nullopt;
     }
 
-    CRegion opaqueRegion() override {
+    CRegion opaqueRegion(Render::CRenderContext&) override {
         return {};
     }
 
@@ -4677,8 +4767,8 @@ static void dumpStatus() {
 
             out << " surf=" << SURF.x << "," << SURF.y << "," << SURF.w
                 << "," << SURF.h << " reported="
-                << g_resize.window->m_reportedSize.x << ","
-                << g_resize.window->m_reportedSize.y;
+                << g_resize.window->backend().reportedSize().x << ","
+                << g_resize.window->backend().reportedSize().y;
         }
 
         if (ROOMIT != g_roomBoxes.end())
@@ -4813,21 +4903,21 @@ static void dumpStatus() {
             if (!W3 || W3->m_workspace != MON->m_activeWorkspace)
                 continue;
 
-            const auto WB = W3->m_target ? W3->m_target->position() :
+            const auto WB = W3->windowTarget() ? W3->windowTarget()->position() :
                                            CBox{};
             out << "  win=" << Compat::windowId(W3)
-                << " float=" << (W3->m_isFloating ? 1 : 0)
+                << " float=" << (W3->isFloating() ? 1 : 0)
                 << " aFull="
-                << W3->alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN)
+                << W3->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FULLSCREEN)
                 << " aActive="
-                << W3->alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE)
+                << W3->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_ACTIVE)
                 << " aFade="
-                << W3->alphaValue(Desktop::View::WINDOW_ALPHA_FADE)
+                << W3->presentation().alphaValue(Desktop::View::WINDOW_ALPHA_FADE)
                 << " box=" << WB.x << "," << WB.y << "," << WB.w << ","
                 << WB.h << " lastFloat="
-                << (W3->m_target ? W3->m_target->lastFloatingSize().x : -1.f)
+                << (W3->windowTarget() ? W3->windowTarget()->lastFloatingSize().x : -1.f)
                 << "x"
-                << (W3->m_target ? W3->m_target->lastFloatingSize().y : -1.f)
+                << (W3->windowTarget() ? W3->windowTarget()->lastFloatingSize().y : -1.f)
                 << "\n";
         }
     }
@@ -4860,7 +4950,8 @@ static void dumpStatus() {
             << PP.GetZ() << ") vel=(" << PV.GetX() << "," << PV.GetY()
             << "," << PV.GetZ() << ") moveVel=(" << s_moveVel.x << ","
             << s_moveVel.y << "," << s_moveVel.z << ") grounded="
-            << g_grounded << " flying=" << g_playerFlying << "\n";
+            << g_grounded << " flying=" << g_playerFlying
+            << " seated=" << g_seated << "\n";
     }
 }
 
@@ -5169,7 +5260,7 @@ static void updatePointerVisual() {
     g_scene.setPointer({});
 }
 
-static void onRenderStage(eRenderStage stage) {
+static void onRenderStage(eRenderStage stage, Render::CRenderContext& ctx) {
     if (g_capturing)
         return;
 
@@ -5239,6 +5330,7 @@ static void onRenderStage(eRenderStage stage) {
     updatePointerVisual();
 
     g_pHyprRenderer->addPassElement(
+        ctx,
         makeUnique<CHypr3DPassElement>(
             g_diagAlpha,
             dt
@@ -6129,6 +6221,83 @@ static void onKeyboardKey(
 // other things (e.g. switching to a dedicated workspace on the way in and
 // back on the way out) can tell the two states apart without tracking its
 // own state, which a config reload would lose.
+// hypr3d.first_person_body([on]): set the first-person body (no argument
+// toggles it); returns the new state.
+// hypr3d.lights([level | on]): room light level 0..1 (true = 1, false =
+// world.dark_level, no argument toggles between the two); self_lit scene
+// objects ignore it. Returns the new target level.
+static int luaLights(lua_State* L) {
+    if (lua_isnumber(L, 1))
+        g_lightTarget = std::clamp(static_cast<float>(lua_tonumber(L, 1)), 0.0f, 1.0f);
+    else if (lua_isboolean(L, 1))
+        g_lightTarget = lua_toboolean(L, 1) ? 1.0f : g_cfgDarkLevel;
+    else
+        g_lightTarget = g_lightTarget > 0.5f * (1.0f + g_cfgDarkLevel) ? g_cfgDarkLevel : 1.0f;
+    if (!g_active)
+        CMapModel::s_lightLevel = g_lightTarget; // no frames to fade over
+    damageCurrentMonitor();
+    lua_pushnumber(L, g_lightTarget);
+    return 1;
+}
+
+// hypr3d.power(group, [on]): switch a power group (scene.<name>.power) on
+// or off -- its screens and lamps black out, its haze fades; no second
+// argument toggles. Returns the new state.
+static int luaPower(lua_State* L) {
+    const char* G = luaL_checkstring(L, 1);
+    auto& T = g_powerTarget.try_emplace(G, 1.0f).first->second;
+    T = lua_isboolean(L, 2) ? (lua_toboolean(L, 2) ? 1.0f : 0.0f) : (T > 0.5f ? 0.0f : 1.0f);
+    if (!g_active)
+        CMapModel::s_power[G] = T; // no frames to fade over
+    damageCurrentMonitor();
+    lua_pushboolean(L, T > 0.5f);
+    return 1;
+}
+
+// hypr3d.gesture(name): play the player's clip `name` once over the current
+// animation (e.g. "Interact", a hand reaching out). Returns false when the
+// character has no such clip.
+static int luaGesture(lua_State* L) {
+    const char* NAME = luaL_checkstring(L, 1);
+    const bool OK = g_scene.player() && g_scene.player()->playOnce(NAME);
+    damageCurrentMonitor();
+    lua_pushboolean(L, OK);
+    return 1;
+}
+
+// hypr3d.sit([on]): sit in player.seat (no argument: sit down); false
+// stands up. Returns whether the player is seated.
+static int luaSit(lua_State* L) {
+    const bool ON = lua_isboolean(L, 1) ? lua_toboolean(L, 1) != 0 : true;
+    if (ON && g_seat.valid) {
+        g_seated = true;
+        auto& CAM = g_scene.camera();
+        CAM.yaw = g_seat.yawDeg * 3.14159265f / 180.f;
+        CAM.position = Vec3{g_seat.x, g_seat.y + g_seat.eye, g_seat.z};
+        if (g_bodyIf && !g_playerBody.IsInvalid()) {
+            const auto CUR = g_bodyIf->GetPosition(g_playerBody);
+            g_bodyIf->SetPosition(g_playerBody, JPH::RVec3(g_seat.x, CUR.GetY(), g_seat.z),
+                                  JPH::EActivation::Activate);
+        }
+        if (g_scene.player())
+            g_scene.player()->setHold(g_seat.pose);
+    } else if (!ON && g_seated) {
+        g_seated = false;
+        if (g_scene.player())
+            g_scene.player()->setHold("");
+    }
+    damageCurrentMonitor();
+    lua_pushboolean(L, g_seated);
+    return 1;
+}
+
+static int luaFirstPersonBody(lua_State* L) {
+    g_cfgFpBody = lua_isboolean(L, 1) ? lua_toboolean(L, 1) : !g_cfgFpBody;
+    damageCurrentMonitor();
+    lua_pushboolean(L, g_cfgFpBody);
+    return 1;
+}
+
 static int luaActive(lua_State* L) {
     lua_pushboolean(L, g_active && g_transitionTarget > 0.5f);
     return 1;
@@ -6207,6 +6376,9 @@ static int luaConfig(lua_State* L) {
     //         flying = true,                -- false: gravity, Space jumps,
     //                                       -- Shift does nothing
     //         walk_bob = true,              -- camera sway while walking
+    //         first_person_body = false,    -- see the (headless) character
+    //                                       -- in first person
+    //         first_person_offset = 0.2,    -- body metres behind the eye
     //     },
     //     map = {
     //         path = "~/map.glb",
@@ -6273,6 +6445,91 @@ static int luaConfig(lua_State* L) {
         size_t LEN = 0;
         const char* STR = lua_tolstring(L, -1, &LEN);
         out.assign(STR, LEN);
+        lua_pop(L, 1);
+        return true;
+    };
+
+    // A string or a list of strings (nil keeps the default).
+    const auto SET_STRINGS = [&](int tidx, const char* key,
+                                 std::vector<std::string>& out) -> bool {
+        lua_getfield(L, tidx, key);
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return true;
+        }
+        out.clear();
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            out.emplace_back(lua_tostring(L, -1));
+            lua_pop(L, 1);
+            return true;
+        }
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        for (int i = 1;; ++i) {
+            lua_rawgeti(L, -1, i);
+            if (lua_isnil(L, -1)) {
+                lua_pop(L, 1);
+                break;
+            }
+            if (lua_type(L, -1) != LUA_TSTRING) {
+                lua_pop(L, 2);
+                return false;
+            }
+            out.emplace_back(lua_tostring(L, -1));
+            lua_pop(L, 1);
+        }
+        lua_pop(L, 1);
+        return true;
+    };
+
+    // power = "group" | { "a", "b" } | { a = { "mat", .. }, b = { .. } }
+    const auto SET_POWER = [&](int tidx, CMapModel::PowerList& out) -> bool {
+        lua_getfield(L, tidx, "power");
+        if (lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return true;
+        }
+        out.clear();
+        if (lua_type(L, -1) == LUA_TSTRING) {
+            out.push_back({lua_tostring(L, -1), {}});
+            lua_pop(L, 1);
+            return true;
+        }
+        if (!lua_istable(L, -1)) {
+            lua_pop(L, 1);
+            return false;
+        }
+        const int T = lua_gettop(L);
+        lua_pushnil(L);
+        while (lua_next(L, T)) {
+            if (lua_type(L, -2) == LUA_TNUMBER && lua_type(L, -1) == LUA_TSTRING) {
+                out.push_back({lua_tostring(L, -1), {}});
+            } else if (lua_type(L, -2) == LUA_TSTRING && lua_istable(L, -1)) {
+                std::pair<std::string, std::vector<std::string>> E{lua_tostring(L, -2), {}};
+                const int M = lua_gettop(L);
+                for (int i = 1;; ++i) {
+                    lua_rawgeti(L, M, i);
+                    if (lua_type(L, -1) != LUA_TSTRING) {
+                        const bool END = lua_isnil(L, -1);
+                        lua_pop(L, 1);
+                        if (!END) {
+                            lua_pop(L, 3);
+                            return false;
+                        }
+                        break;
+                    }
+                    E.second.emplace_back(lua_tostring(L, -1));
+                    lua_pop(L, 1);
+                }
+                out.push_back(std::move(E));
+            } else {
+                lua_pop(L, 3);
+                return false;
+            }
+            lua_pop(L, 1);
+        }
         lua_pop(L, 1);
         return true;
     };
@@ -6357,6 +6614,10 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: world.under_layers must be a boolean");
         if (!SET_BOOL(idx, "grid", g_cfgGrid, "world.grid"))
             return luaL_error(L, "hypr3d.config: world.grid must be a boolean");
+        if (!SET_NUM(idx, "dark_level", g_cfgDarkLevel, "world.dark_level"))
+            return luaL_error(L, "hypr3d.config: world.dark_level must be a number");
+        g_cfgDarkLevel = std::clamp(g_cfgDarkLevel, 0.0f, 1.0f);
+        CMapModel::s_darkLevel = g_cfgDarkLevel;
         lua_pop(L, 1);
     }
 
@@ -6489,6 +6750,12 @@ static int luaConfig(lua_State* L) {
             return luaL_error(L, "hypr3d.config: player.flying must be a boolean");
         if (!SET_BOOL(idx, "walk_bob", g_cfgWalkBob, "player.walk_bob"))
             return luaL_error(L, "hypr3d.config: player.walk_bob must be a boolean");
+        if (!SET_BOOL(idx, "first_person_body", g_cfgFpBody,
+                      "player.first_person_body"))
+            return luaL_error(L, "hypr3d.config: player.first_person_body must be a boolean");
+        if (!SET_NUM(idx, "first_person_offset", g_cfgFpBodyBack,
+                     "player.first_person_offset"))
+            return luaL_error(L, "hypr3d.config: player.first_person_offset must be a number");
         if (!SET_BOOL(idx, "collision", g_playerCollision, "player.collision"))
             return luaL_error(L, "hypr3d.config: player.collision must be a boolean");
 
@@ -6526,6 +6793,30 @@ static int luaConfig(lua_State* L) {
                 return false;
             return true;
         };
+
+        // player.seat = { x, y, z, yaw, eye, hip, on_enter, pose }
+        lua_getfield(L, idx, "seat");
+        if (lua_istable(L, -1)) {
+            const int ST = lua_gettop(L);
+            SSeatCfg S;
+            S.valid = true;
+            if (!SET_NUM(ST, "x", S.x, "player.seat.x") || !SET_NUM(ST, "y", S.y, "player.seat.y") ||
+                !SET_NUM(ST, "z", S.z, "player.seat.z") || !SET_NUM(ST, "yaw", S.yawDeg, "player.seat.yaw") ||
+                !SET_NUM(ST, "eye", S.eye, "player.seat.eye") || !SET_NUM(ST, "hip", S.hip, "player.seat.hip") ||
+                !SET_BOOL(ST, "on_enter", S.onEnter, "player.seat.on_enter") ||
+                !SET_STRING(ST, "pose", S.pose, "player.seat.pose")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: player.seat fields are numbers (x, y, z, yaw, eye, hip), on_enter a boolean, pose a string");
+            }
+            g_seat = S;
+        } else if (!lua_isnil(L, -1)) {
+            lua_pop(L, 1);
+            return luaL_error(L, "hypr3d.config: player.seat must be a table");
+        }
+        lua_pop(L, 1);
+
+        if (!SET_STRINGS(idx, "screen_materials", g_playerCfg.screenMaterials))
+            return luaL_error(L, "hypr3d.config: player.screen_materials must be a list of strings");
 
         // player.mesh: the character's visual, described exactly like a
         // scene object's mesh. The transform.position anchors the model
@@ -6771,6 +7062,30 @@ static int luaConfig(lua_State* L) {
                 lua_pop(L, 1);
                 return luaL_error(L, "hypr3d.config: scene.<name>.center_offset must be a table { x = .., y = .., z = .. }");
             }
+            if (!SET_BOOL(OIDX, "self_lit", OBJ.selfLit, "scene.<name>.self_lit")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.self_lit must be a boolean");
+            }
+            if (!SET_NUM(OIDX, "dark_level", OBJ.darkLevel, "scene.<name>.dark_level")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.dark_level must be a number");
+            }
+            if (!SET_POWER(OIDX, OBJ.power)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.power must be a group name, a list of them, or { group = { materials } }");
+            }
+            if (!SET_STRINGS(OIDX, "screen_materials", OBJ.screenMaterials)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.screen_materials must be a list of strings");
+            }
+            if (!SET_BOOL(OIDX, "screens", OBJ.screens, "scene.<name>.screens")) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.screens must be a boolean");
+            }
+            if (!SET_STRINGS(OIDX, "power_materials", OBJ.powerMaterials)) {
+                lua_pop(L, 1);
+                return luaL_error(L, "hypr3d.config: scene.<name>.power_materials must be a list of strings");
+            }
 
             // mesh = { ... }: the shared visual description -- overrides
             // the legacy flat keys when present.
@@ -6955,14 +7270,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
         3000
     );
 
-    if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:toggle", dispatchToggle))
-        throw std::runtime_error("[hypr3d] failed to register toggle dispatcher");
-
-    if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:open", dispatchOpen))
-        throw std::runtime_error("[hypr3d] failed to register open dispatcher");
-
-    if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:close", dispatchClose))
-        throw std::runtime_error("[hypr3d] failed to register close dispatcher");
+    // Lua-config Hyprland (0.57+) keeps addDispatcherV2 for ABI only and makes
+    // it fail; the hl.plugin.hypr3d.* Lua functions below are the real entry
+    // points there, so the legacy dispatchers are best-effort.
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:toggle", dispatchToggle);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:open", dispatchOpen);
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:close", dispatchClose);
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "toggle", luaToggle))
         throw std::runtime_error("[hypr3d] failed to register Lua toggle");
@@ -6972,6 +7285,22 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "close", luaClose))
         throw std::runtime_error("[hypr3d] failed to register Lua close");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "first_person_body",
+                                     luaFirstPersonBody))
+        throw std::runtime_error("[hypr3d] failed to register Lua first_person_body");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "lights", luaLights))
+        throw std::runtime_error("[hypr3d] failed to register Lua lights");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "power", luaPower))
+        throw std::runtime_error("[hypr3d] failed to register Lua power");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "gesture", luaGesture))
+        throw std::runtime_error("[hypr3d] failed to register Lua gesture");
+
+    if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "sit", luaSit))
+        throw std::runtime_error("[hypr3d] failed to register Lua sit");
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "active", luaActive))
         throw std::runtime_error("[hypr3d] failed to register Lua active");
@@ -7000,9 +7329,12 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
 
     static auto renderStage =
         Event::bus()->m_events.render.stage.listen(
-            [](eRenderStage stage) {
+            [](Event::SRenderStageEvent event) {
                 try {
-                    onRenderStage(stage);
+                    // 0.57: the draw context rides on the event; stages
+                    // without one (PRE/POST) have nothing to draw into.
+                    if (event.context)
+                        onRenderStage(event.stage, event.context->get());
                 } catch (const std::exception& e) {
                     dumpErrorNow(std::string{"renderStage: "} + e.what());
                 } catch (...) {
@@ -7093,7 +7425,7 @@ APICALL EXPORT void PLUGIN_EXIT() {
     // IHyprRenderer::beginRender, measured on 0.56.2). `hyprctl plugin unload`
     // calls this from the event loop, between frames, so the element is done.
     if (g_pHyprRenderer)
-        g_pHyprRenderer->m_renderPass.removeAllOfType("Hypr3D");
+        g_pHyprRenderer->context().m_pass.removeAllOfType("Hypr3D");
 
     if (g_deactivateLater && g_pEventLoopManager)
         g_pEventLoopManager->removeDoLater(g_deactivateLater);
@@ -7139,8 +7471,8 @@ APICALL EXPORT void PLUGIN_EXIT() {
     if (const auto MON = targetMonitor(); MON && MON->m_activeWorkspace) {
         for (auto const& W3 : Desktop::windowState()->windows()) {
             if (W3 && W3->m_workspace == MON->m_activeWorkspace &&
-                !W3->m_pinned)
-                *W3->alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN) = 1.F;
+                !bool(W3->m_state & Desktop::View::WINDOW_STATE_PINNED))
+                *W3->presentation().alpha(Desktop::View::WINDOW_ALPHA_FULLSCREEN) = 1.F;
         }
     }
 

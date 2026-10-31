@@ -108,6 +108,15 @@ class CPlayerModel {
     void setAnim(EState state, int index);
     bool setAnim(EState state, const std::string& name);
 
+    // One-shot gesture (hypr3d.gesture): plays the named clip once on top of
+    // the current state, only on the nodes that clip animates (rotations),
+    // easing in and out. False when there is no such clip.
+    bool playOnce(const std::string& name);
+
+    // Held pose (hypr3d.sit): the named clip's first frame overrides the
+    // nodes it animates, eased in/out over 0.3 s; "" releases it.
+    void setHold(const std::string& name);
+
     // World placement of the model's ORIGIN (feet for character exports):
     // anchor offset (rotates with the model), facing (yaw radians),
     // per-axis scale. Also the material overrides from the shared mesh
@@ -116,6 +125,17 @@ class CPlayerModel {
                  const Vec3& offset, const Vec3& rotDeg);
     void setFlat(bool flat) {
         m_flat = flat;
+    }
+
+    // Collapse the head joints (first-person body view). Takes effect on
+    // the next update().
+    // Materials that ignore the room light (a wrist screen).
+    void setScreenMaterials(const std::vector<std::string>& m) {
+        m_screenMaterials = m;
+    }
+
+    void setHideHead(bool hide) {
+        m_hideHead = hide;
     }
 
     // Playback speed multiplier for a state's clip (1 = as authored).
@@ -208,6 +228,7 @@ class CPlayerModel {
         unsigned int texture = 0;
         float        color[4] = {1.f, 1.f, 1.f, 1.f};
         int          node = -1;
+        std::string  material; // glTF material name
         // Base (node-space) vertices: positions + normals are transformed
         // and re-uploaded every update(); the uvs are static.
         std::vector<float> basePos;
@@ -253,6 +274,16 @@ class CPlayerModel {
     // bind bakes it in), false = glTF spec (see load()).
     std::vector<bool>      m_skinMeshWorld;
     std::vector<SPrim>     m_prims;
+    // First-person body: the head subtree (the shallowest node named
+    // "head*" and everything under it) collapses to a point so the eye,
+    // which sits inside it, sees the shoulders and body instead.
+    std::vector<bool>      m_inHead;
+    bool                   m_hideHead = false;
+    int                    m_onceAnim = -1;
+    int                    m_holdAnim = -1, m_holdTarget = -1;
+    float                  m_holdW = 0.f;
+    float                  m_onceTime = 0.f;
+    std::vector<std::string> m_screenMaterials;
 
     EState m_state      = EState::Idle;
     EState m_prevState  = EState::Idle;
@@ -275,7 +306,7 @@ class CPlayerModel {
     unsigned int m_program = 0;
     int          m_uMVP = -1, m_uModel = -1, m_uColor = -1, m_uTex = -1,
         m_uHasTex = -1, m_uCamPos = -1, m_uJoints = -1, m_uSkinned = -1,
-        m_uMeshWorld = -1, m_uFlat = -1;
+        m_uMeshWorld = -1, m_uFlat = -1, m_uLight = -1;
 };
 
 } // namespace H3D

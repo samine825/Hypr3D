@@ -1,4 +1,5 @@
 #include "Render/PlayerModel.hpp"
+#include "Render/MapModel.hpp"
 
 #include "../../third_party/cgltf.h"
 
@@ -15,6 +16,7 @@
 #include <hyprgraphics/image/Image.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <memory>
@@ -89,6 +91,7 @@ uniform bool uHasTex;
 uniform bool uFlat;
 uniform vec4 uColor;
 uniform vec3 uCamPos;
+uniform float uLight; // room light level
 
 out vec4 fragColor;
 
@@ -98,7 +101,7 @@ void main() {
     // flat: the texture carries all lighting (baked/toon characters)
     float diff = uFlat ? 1.0 : dot(N, L) * 0.5 + 0.5; // half-lambert
     vec4 base = uHasTex ? texture(uTex, vUv) : vec4(1.0);
-    fragColor = vec4(base.rgb * uColor.rgb * diff, base.a * uColor.a);
+    fragColor = vec4(base.rgb * uColor.rgb * diff * uLight, base.a * uColor.a);
 }
 )GLSL";
 
@@ -353,6 +356,26 @@ bool CPlayerModel::setAnim(EState state, const std::string& name) {
     return false;
 }
 
+bool CPlayerModel::playOnce(const std::string& name) {
+    for (int i = 0; i < static_cast<int>(m_anims.size()); ++i) {
+        if (m_anims[i].name == name && m_anims[i].duration > 0.f) {
+            m_onceAnim = i;
+            m_onceTime = 0.f;
+            return true;
+        }
+    }
+    return false;
+}
+
+void CPlayerModel::setHold(const std::string& name) {
+    m_holdTarget = -1;
+    for (int i = 0; i < static_cast<int>(m_anims.size()); ++i)
+        if (!name.empty() && m_anims[i].name == name)
+            m_holdTarget = i;
+    if (m_holdTarget >= 0)
+        m_holdAnim = m_holdTarget;
+}
+
 // --- pose / evaluation --------------------------------------------------------
 
 void CPlayerModel::setPose(const Vec3& feet, float yawRad,
@@ -423,6 +446,42 @@ void CPlayerModel::evaluateNodes() {
         }
     }
 
+    // Held pose (seated): its clip's first frame, translations and
+    // rotations, at the eased weight.
+    if (m_holdAnim >= 0 && m_holdAnim < static_cast<int>(m_anims.size()) && m_holdW > 0.f) {
+        const float W = m_holdW * m_holdW * (3.f - 2.f * m_holdW);
+        for (const auto& C : m_anims[m_holdAnim].channels) {
+            if (C.node < 0 || C.node >= static_cast<int>(NN) ||
+                C.sampler < 0 || C.sampler >= static_cast<int>(m_samplers.size()))
+                continue;
+            float V[4];
+            m_samplers[C.sampler].sample(0.f, V);
+            if (C.path == 1)
+                R[C.node] = SQuat::slerp(R[C.node], SQuat{V[0], V[1], V[2], V[3]}, W);
+            else if (C.path == 0)
+                T[C.node] = T[C.node] + (Vec3{V[0], V[1], V[2]} - T[C.node]) * W;
+        }
+    }
+
+    // One-shot gesture layered on top: ease in over 0.08 s, out over the
+    // last 0.15 s, rotations only, on the clip's own nodes.
+    if (m_onceAnim >= 0 && m_onceAnim < static_cast<int>(m_anims.size())) {
+        const auto& A   = m_anims[m_onceAnim];
+        const float DUR = A.duration;
+        const float IN  = std::min(1.f, m_onceTime / 0.08f);
+        const float OUT = std::min(1.f, std::max(0.f, (DUR - m_onceTime) / 0.15f));
+        float W = std::min(IN, OUT);
+        W = W * W * (3.f - 2.f * W);
+        for (const auto& C : A.channels) {
+            if (C.path != 1 || C.node < 0 || C.node >= static_cast<int>(NN) ||
+                C.sampler < 0 || C.sampler >= static_cast<int>(m_samplers.size()))
+                continue;
+            float V[4];
+            m_samplers[C.sampler].sample(m_onceTime, V);
+            R[C.node] = SQuat::slerp(R[C.node], SQuat{V[0], V[1], V[2], V[3]}, W);
+        }
+    }
+
     m_world.assign(NN, Mat4::identity());
     for (const int I : m_order) {
         const Mat4 LOCAL = Mat4::translation(T[I]) * (quatToMat4(R[I]) *
@@ -474,6 +533,21 @@ void CPlayerModel::update(float dt) {
         }
     }
 
+    {
+        const float TGT = m_holdTarget >= 0 ? 1.f : 0.f;
+        const float STEP = std::max(dt, 0.f) / 0.3f;
+        m_holdW = m_holdW < TGT ? std::min(TGT, m_holdW + STEP) : std::max(TGT, m_holdW - STEP);
+        if (m_holdW <= 0.f && m_holdTarget < 0)
+            m_holdAnim = -1;
+    }
+
+    if (m_onceAnim >= 0) {
+        m_onceTime += std::max(dt, 0.f);
+        if (m_onceAnim >= static_cast<int>(m_anims.size()) ||
+            m_onceTime >= m_anims[m_onceAnim].duration)
+            m_onceAnim = -1;
+    }
+
     evaluateNodes();
 
     // Joint matrices per skin: jointWorld * inverseBind (the glTF spec).
@@ -490,6 +564,12 @@ void CPlayerModel::update(float dt) {
             const Mat4 WJ = N >= 0 && N < static_cast<int>(m_world.size())
                 ? m_world[N] : Mat4::identity();
             OUT[j] = WJ * SK.invBind[j];
+            // Hidden head: every vertex on this joint lands on the joint's
+            // own origin (zero scale), so the head shrinks to the neck.
+            if (m_hideHead && N >= 0 && N < static_cast<int>(m_inHead.size()) &&
+                m_inHead[N])
+                OUT[j] = Mat4::translation(Vec3{WJ.m[12], WJ.m[13], WJ.m[14]}) *
+                    Mat4::scale(Vec3{0.f, 0.f, 0.f});
         }
     }
 
@@ -747,6 +827,31 @@ bool CPlayerModel::load(const std::string& path) {
         return DEPTH(A) < DEPTH(B);
     });
 
+    // Head subtree for the first-person body: the shallowest "head*" node
+    // (case-insensitive), then its descendants (m_order is parents first).
+    m_inHead.assign(m_nodes.size(), false);
+    {
+        int headNode = -1, headDepth = 1 << 30;
+        for (cgltf_size i = 0; i < data->nodes_count; ++i) {
+            std::string nm = data->nodes[i].name ? data->nodes[i].name : "";
+            for (auto& c : nm)
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            if (nm.rfind("head", 0) != 0)
+                continue;
+            int d = 0;
+            for (int p = m_nodes[i].parent; p >= 0 && d < 256; p = m_nodes[p].parent)
+                ++d;
+            if (d < headDepth)
+                headDepth = d, headNode = static_cast<int>(i);
+        }
+        if (headNode >= 0) {
+            m_inHead[headNode] = true;
+            for (const int I : m_order)
+                if (m_nodes[I].parent >= 0 && m_inHead[m_nodes[I].parent])
+                    m_inHead[I] = true;
+        }
+    }
+
     // Skins.
     m_skins.clear();
     for (cgltf_size s = 0; s < data->skins_count; ++s) {
@@ -901,6 +1006,8 @@ bool CPlayerModel::load(const std::string& path) {
 
             if (PR.material) {
                 const auto& M = *PR.material;
+                if (M.name)
+                    P.material = M.name;
                 for (int k = 0; k < 4; ++k)
                     P.color[k] = M.pbr_metallic_roughness.base_color_factor[k];
                 if (M.pbr_metallic_roughness.base_color_texture.texture &&
@@ -1008,6 +1115,7 @@ bool CPlayerModel::load(const std::string& path) {
             m_uSkinned   = glGetUniformLocation(P, "uSkinned");
             m_uMeshWorld = glGetUniformLocation(P, "uMeshWorld");
             m_uFlat      = glGetUniformLocation(P, "uFlat");
+            m_uLight     = glGetUniformLocation(P, "uLight");
         }
         glDeleteShader(VS);
         glDeleteShader(FS);
@@ -1097,6 +1205,7 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
     glUniformMatrix4fv(m_uModel, 1, GL_FALSE, MODEL.m.data());
     glUniform1i(m_uTex, 0);
     glUniform1i(m_uFlat, m_flat);
+    glUniform1f(m_uLight, CMapModel::s_lightLevel);
     glUniform3f(m_uCamPos, cameraPos.x, cameraPos.y, cameraPos.z);
 
     glActiveTexture(GL_TEXTURE0);
@@ -1104,6 +1213,10 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
 
     for (const auto& P : m_prims) {
         if (!P.count)
+            continue;
+        // Rigid parts riding the head (a separate helmet mesh).
+        if (m_hideHead && P.skin < 0 && P.node >= 0 &&
+            P.node < static_cast<int>(m_inHead.size()) && m_inHead[P.node])
             continue;
 
         if (P.gpuSkinned) {
@@ -1125,6 +1238,10 @@ void CPlayerModel::draw(const Mat4& vp, const Vec3& cameraPos) const {
                     P.color[1] * m_emissiveScale,
                     P.color[2] * m_emissiveScale, P.color[3]);
         glUniform1i(m_uHasTex, P.texture != 0);
+        glUniform1f(m_uLight,
+                    std::find(m_screenMaterials.begin(), m_screenMaterials.end(),
+                              P.material) != m_screenMaterials.end()
+                        ? 1.0f : CMapModel::s_lightLevel);
         glBindTexture(GL_TEXTURE_2D, P.texture);
         glBindVertexArray(P.vao);
         if (P.indexed)

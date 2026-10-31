@@ -4,12 +4,15 @@
 #include <hyprland/src/desktop/state/WindowState.hpp>
 #include <hyprland/src/desktop/state/ViewState.hpp>
 #include <hyprland/src/desktop/state/LayerState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 #include <hyprland/src/desktop/view/LayerSurface.hpp>
 #include <hyprland/src/desktop/view/Popup.hpp>
-#include <hyprland/src/desktop/Workspace.hpp>
+#include <hyprland/src/workspace/HLWorkspace.hpp>
 #include <hyprland/src/layout/algorithm/Algorithm.hpp>
 #include <hyprland/src/layout/target/Target.hpp>
+#include <hyprland/src/layout/target/WindowTarget.hpp>
+#include <hyprland/src/layout/space/Space.hpp>
+#include <hyprland/src/state/WorkspaceState.hpp>
 #include <hyprland/src/managers/SeatManager.hpp>
 #include <hyprland/src/protocols/LayerShell.hpp>
 // CLayerShellResource's m_surface (CWLSurfaceResource) needs the full type
@@ -29,10 +32,21 @@ namespace H3D::Compat {
 // During a workspace switch the outgoing workspace still renders while it
 // slides away; picking its windows up ghosted them out of their tiling for
 // a few frames, and the layout re-tiled (resized) them on the way back.
+// 0.57 dropped CWorkspace::inert(): a workspace is gone once the workspace
+// state no longer lists it.
+static bool workspaceGone(const PHLWORKSPACE& ws) {
+    if (!ws || !State::workspaceState())
+        return true;
+    for (const auto& W : State::workspaceState()->workspaces())
+        if (W == ws)
+            return false;
+    return true;
+}
+
 static bool onRoomWorkspace(const PHLWINDOW& window, const PHLMONITOR& monitor) {
     const auto WORKSPACE = window->m_workspace;
 
-    return window->m_pinned || WORKSPACE == monitor->m_activeWorkspace ||
+    return bool(window->m_state & Desktop::View::WINDOW_STATE_PINNED) || WORKSPACE == monitor->m_activeWorkspace ||
         (WORKSPACE && WORKSPACE == monitor->m_activeSpecialWorkspace);
 }
 
@@ -44,7 +58,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
         return out;
 
     for (const auto& window : Desktop::windowState()->windows()) {
-        if (!window || !window->m_isMapped || window->isHidden())
+        if (!window || !window->mapped() || window->isHidden())
             continue;
 
         const auto WORKSPACE = window->m_workspace;
@@ -63,7 +77,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
         SWindowInfo info;
         info.id       = reinterpret_cast<std::uintptr_t>(window.get());
         info.window   = window;
-        info.floating = window->m_isFloating;
+        info.floating = window->isFloating();
 
         if (!decoratedSurfaceBox(
                 window,
@@ -75,9 +89,9 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
 
         // X11 menus are override-redirect windows at absolute screen
         // positions: they belong next to the window they came from.
-        if (window->m_isX11 && window->isX11OverrideRedirect()) {
+        if (window->backend().isX11() && window->backend().traits().overrideRedirect) {
             info.attached = true;
-            if (const auto PARENT = window->x11Parent())
+            if (const auto PARENT = window->backend().parent())
                 info.parentId = reinterpret_cast<std::uintptr_t>(PARENT.get());
         }
 
@@ -89,7 +103,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
     const size_t WINDOWS = out.size();
     for (size_t w = 0; w < WINDOWS; ++w) {
         const auto WINDOW = out[w].window;
-        if (!WINDOW || !WINDOW->m_popupHead)
+        if (!WINDOW || !WINDOW->popupHead())
             continue;
 
         struct SCollect {
@@ -97,13 +111,13 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
             PHLMONITOR                monitor;
             std::uintptr_t            parentId;
             Desktop::View::CPopup*    head;
-        } COLLECT{&out, monitor, out[w].id, WINDOW->m_popupHead.get()};
+        } COLLECT{&out, monitor, out[w].id, WINDOW->popupHead().get()};
 
-        WINDOW->m_popupHead->breadthfirst(
+        WINDOW->popupHead()->breadthfirst(
             [](SP<Desktop::View::CPopup> popup, void* data) {
                 auto* C = static_cast<SCollect*>(data);
-                if (!popup || popup.get() == C->head || !popup->m_mapped ||
-                    !popup->visible())
+                if (!popup || popup.get() == C->head || !popup->mapped() ||
+                    !popup->mapped())
                     return;
 
                 const Vector2D SIZE = popup->size();
@@ -139,7 +153,7 @@ std::vector<SWindowInfo> enumerateEligibleWindows(const PHLMONITOR& monitor,
         for (const auto& LSREF : LAYERLIST) {
             const auto LS = LSREF.lock();
 
-            if (!LS || !LS->visible() || LS->m_layer == LAYER_BACKGROUND ||
+            if (!LS || !LS->mapped() || LS->m_layer == LAYER_BACKGROUND ||
                 (underLayers && LS->m_layer != LAYER_BOTTOM))
                 continue;
 
@@ -213,7 +227,7 @@ bool decoratedSurfaceBox(
 }
 
 bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor) {
-    if (!window || !window->m_isMapped || window->isHidden())
+    if (!window || !window->mapped() || window->isHidden())
         return false;
 
     const auto WORKSPACE = window->m_workspace;
@@ -233,14 +247,14 @@ bool isWindowEligible(const PHLWINDOW& window, const PHLMONITOR& monitor) {
 SWindowLayoutSave saveWindowLayout(const PHLWINDOW& window) {
     SWindowLayoutSave save;
 
-    if (!window || !window->m_target)
+    if (!window || !window->windowTarget())
         return save;
 
     save.id          = reinterpret_cast<std::uintptr_t>(window.get());
     save.window      = window;
-    save.box         = window->m_target->position();
-    save.space       = window->m_target->space();
-    save.wasFloating = window->m_target->floating();
+    save.box         = window->windowTarget()->position();
+    save.space       = window->windowTarget()->space();
+    save.wasFloating = window->windowTarget()->floating();
 
     return save;
 }
@@ -251,13 +265,13 @@ void applyWindowGhost(SWindowLayoutSave& save) {
 
     const auto WINDOW = save.window.lock();
 
-    if (!WINDOW || !WINDOW->m_target)
+    if (!WINDOW || !WINDOW->windowTarget())
         return;
 
     // The 3D view owns geometry. Force the target floating first, then ghost
     // it out of the layout so a tiled layout cannot overwrite our changes.
-    WINDOW->m_target->setFloating(true);
-    WINDOW->m_target->setSpaceGhost(save.space);
+    WINDOW->windowTarget()->setFloating(true);
+    WINDOW->windowTarget()->setSpaceGhost(save.space);
     save.ghosted = true;
 }
 
@@ -267,14 +281,14 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
 
     const auto WINDOW = save.window.lock();
 
-    if (!WINDOW || !WINDOW->m_target)
+    if (!WINDOW || !WINDOW->windowTarget())
         return;
 
     // A window closed while the room was open can outlive its unmap (the
     // close animation keeps the object) with no workspace left; assigning it
     // a space then crashed in moveToWorkspace, which reads the OLD
     // workspace (SIGSEGV in CWorkspace::isVisible). Hyprland is done with it.
-    if (!WINDOW->m_isMapped || !WINDOW->m_workspace)
+    if (!WINDOW->mapped() || !WINDOW->m_workspace)
         return;
 
     if (!save.ghosted) {
@@ -286,9 +300,9 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
         // and a rebuild could only approximate it. Pin the remembered
         // floating size to the current box so a later manual float uses
         // the geometry this window actually has.
-        WINDOW->m_target->rememberFloatingSize(
-            Vector2D{WINDOW->m_target->position().w,
-                     WINDOW->m_target->position().h});
+        WINDOW->windowTarget()->rememberFloatingSize(
+            Vector2D{WINDOW->windowTarget()->position().w,
+                     WINDOW->windowTarget()->position().h});
 
         if (g_pHyprRenderer)
             g_pHyprRenderer->damageWindow(WINDOW);
@@ -302,7 +316,7 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     // of a window it does not know. With the ghost cleared first, HAD_SPACE
     // is false and the space->add() branch runs, which properly inserts the
     // target into the layout algorithm.
-    WINDOW->m_target->setSpaceGhost(nullptr);
+    WINDOW->windowTarget()->setSpaceGhost(nullptr);
 
     // The saved space can outlive its workspace: a session lock or a monitor
     // re-plug tears workspaces down and rebuilds them, and assigning into a
@@ -312,23 +326,23 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
     SP<Layout::CSpace> SPACE = save.space;
     if (SPACE) {
         const auto WS = SPACE->workspace();
-        if (!WS || WS->inert())
+        if (workspaceGone(WS))
             SPACE = nullptr;
     }
-    if (!SPACE && WINDOW->m_workspace && !WINDOW->m_workspace->inert())
-        SPACE = WINDOW->m_workspace->m_space;
+    if (!SPACE && !workspaceGone(WINDOW->m_workspace))
+        SPACE = WINDOW->m_workspace->space();
 
     if (SPACE)
-        WINDOW->m_target->assignToSpace(SPACE);
+        WINDOW->windowTarget()->assignToSpace(SPACE);
     else
-        WINDOW->m_target->assignToSpace(nullptr); // force-clear the ghost flag
+        WINDOW->windowTarget()->assignToSpace(nullptr); // force-clear the ghost flag
 
     if (save.wasFloating) {
         // The exact box the window had when 3D was entered: sizes are
         // per-mode, and a 3D resize must not survive into 2D (the exit
         // morph animates the real box back to this one).
-        WINDOW->m_target->setPositionGlobal(save.box);
-        WINDOW->m_target->rememberFloatingSize(Vector2D{save.box.w, save.box.h});
+        WINDOW->windowTarget()->setPositionGlobal(save.box);
+        WINDOW->windowTarget()->rememberFloatingSize(Vector2D{save.box.w, save.box.h});
         g_pHyprRenderer->damageWindow(WINDOW);
         return;
     }
@@ -350,15 +364,15 @@ void restoreWindowLayout(SWindowLayoutSave& save) {
 
     if (save.space) {
         if (const auto ALGO = save.space->algorithm()) {
-            ALGO->removeTarget(WINDOW->m_target);
-            WINDOW->m_target->setFloating(false);
-            ALGO->moveTarget(WINDOW->m_target, save.box.middle());
+            ALGO->removeTarget(WINDOW->windowTarget());
+            WINDOW->windowTarget()->setFloating(false);
+            ALGO->moveTarget(WINDOW->windowTarget(), save.box.middle());
             adopted = true;
         }
     }
 
     if (!adopted)
-        WINDOW->m_target->setFloating(false);
+        WINDOW->windowTarget()->setFloating(false);
 }
 
 bool fixupGhostedWindow(const SWindowLayoutSave& save) {
@@ -367,15 +381,15 @@ bool fixupGhostedWindow(const SWindowLayoutSave& save) {
 
     const auto WINDOW = save.window.lock();
 
-    if (!WINDOW || !WINDOW->m_target || WINDOW->m_target->floating())
+    if (!WINDOW || !WINDOW->windowTarget() || WINDOW->windowTarget()->floating())
         return false;
 
     if (save.space) {
         if (const auto ALGO = save.space->algorithm())
-            ALGO->removeTarget(WINDOW->m_target);
+            ALGO->removeTarget(WINDOW->windowTarget());
     }
 
-    WINDOW->m_target->setFloating(true);
+    WINDOW->windowTarget()->setFloating(true);
 
     if (g_pHyprRenderer)
         g_pHyprRenderer->damageWindow(WINDOW);
@@ -412,10 +426,10 @@ void restoreWindowLayoutSettle(const std::vector<SWindowLayoutSave>& saves) {
 }
 
 bool driveWindowBox(const PHLWINDOW& window, const CBox& box) {
-    if (!window || !window->m_target)
+    if (!window || !window->windowTarget())
         return false;
 
-    const CBox CURRENT = window->m_target->position();
+    const CBox CURRENT = window->windowTarget()->position();
 
     const bool unchanged =
         std::fabs(CURRENT.x - box.x) < 0.01 &&
@@ -426,14 +440,14 @@ bool driveWindowBox(const PHLWINDOW& window, const CBox& box) {
     if (unchanged)
         return false;
 
-    window->m_target->setPositionGlobal(box);
-    window->m_target->rememberFloatingSize(Vector2D{box.w, box.h});
+    window->windowTarget()->setPositionGlobal(box);
+    window->windowTarget()->rememberFloatingSize(Vector2D{box.w, box.h});
     // The room's box writes must land instantly: the snapshot's box comes
     // from the window's ANIMATED geometry (getWindowMainSurfaceBox reads
     // GEOMETRIC_CURRENT), so an animated drive makes the quad trail the
     // gesture -- a fresh window's vars even carry the slow open-animation
     // config. Same trick the compositor's own drag controller uses.
-    window->m_target->warpPositionSize();
+    window->windowTarget()->warpPositionSize();
 
     if (g_pHyprRenderer)
         g_pHyprRenderer->damageWindow(window);
@@ -442,17 +456,17 @@ bool driveWindowBox(const PHLWINDOW& window, const CBox& box) {
 }
 
 CBox currentWindowBox(const PHLWINDOW& window) {
-    if (!window || !window->m_target)
+    if (!window || !window->windowTarget())
         return {};
 
-    return window->m_target->position();
+    return window->windowTarget()->position();
 }
 
 bool setWindowBox(const PHLWINDOW& window, const CBox& box) {
-    if (!window || !window->m_target)
+    if (!window || !window->windowTarget())
         return false;
 
-    const CBox CURRENT = window->m_target->position();
+    const CBox CURRENT = window->windowTarget()->position();
 
     const bool unchanged =
         std::fabs(CURRENT.x - box.x) < 0.01 &&
@@ -463,10 +477,10 @@ bool setWindowBox(const PHLWINDOW& window, const CBox& box) {
     if (unchanged)
         return false;
 
-    window->m_target->setFloating(true);
-    window->m_target->setPositionGlobal(box);
-    window->m_target->rememberFloatingSize(Vector2D{box.w, box.h});
-    window->m_target->warpPositionSize(); // instant landing, see driveWindowBox
+    window->windowTarget()->setFloating(true);
+    window->windowTarget()->setPositionGlobal(box);
+    window->windowTarget()->rememberFloatingSize(Vector2D{box.w, box.h});
+    window->windowTarget()->warpPositionSize(); // instant landing, see driveWindowBox
 
     if (g_pHyprRenderer)
         g_pHyprRenderer->damageWindow(window);
@@ -479,14 +493,14 @@ PHLWINDOW findPopupParentById(std::uintptr_t id) {
         return nullptr;
 
     for (const auto& WINDOW : Desktop::windowState()->windows()) {
-        if (!WINDOW || !WINDOW->m_isMapped || !WINDOW->m_popupHead)
+        if (!WINDOW || !WINDOW->mapped() || !WINDOW->popupHead())
             continue;
 
         struct SFind {
             std::uintptr_t id;
             bool           found = false;
         } FIND{id};
-        WINDOW->m_popupHead->breadthfirst(
+        WINDOW->popupHead()->breadthfirst(
             [](SP<Desktop::View::CPopup> popup, void* data) {
                 auto* F = static_cast<SFind*>(data);
                 if (popup && reinterpret_cast<std::uintptr_t>(popup.get()) == F->id)
@@ -530,11 +544,11 @@ void clearPointerFocus() {
 // offset, so their hits arrive in the window's space) or the window itself.
 // `local` becomes local to the returned surface.
 static SP<CWLSurfaceResource> surfaceAt(const PHLWINDOW& window, Vector2D& local) {
-    if (window->m_popupHead) {
+    if (window->popupHead()) {
         const auto SURF = window->getWindowMainSurfaceBox();
         const Vector2D GLOBAL = Vector2D{SURF.x, SURF.y} + local;
-        if (const auto POPUP = window->m_popupHead->at(GLOBAL, true);
-            POPUP && POPUP.get() != window->m_popupHead.get()) {
+        if (const auto POPUP = window->popupHead()->at(GLOBAL, true);
+            POPUP && POPUP.get() != window->popupHead().get()) {
             if (const auto RES = POPUP->resource()) {
                 local = GLOBAL - POPUP->coordsGlobal();
                 return RES;

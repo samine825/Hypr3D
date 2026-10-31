@@ -2,7 +2,7 @@
 
 #include <hyprland/src/desktop/state/FocusState.hpp>
 #include <hyprland/src/desktop/state/WindowState.hpp>
-#include <hyprland/src/desktop/view/Window.hpp>
+#include <hyprland/src/desktop/view/window/Window.hpp>
 
 namespace H3D::Compat {
 
@@ -37,7 +37,7 @@ PHLWINDOW findWindowById(std::uintptr_t id) {
         if (!window || windowId(window) != id)
             continue;
 
-        if (!window->m_isMapped || window->isHidden())
+        if (!window->mapped() || window->isHidden())
             return nullptr;
 
         return window;
