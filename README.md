@@ -168,6 +168,7 @@ end
 | `hypr3d.toggle()`                  | open the room if closed, close it if open         |
 | `hypr3d.open()` / `hypr3d.close()` | explicit open / close                             |
 | `hypr3d.active()`                  | `true` while the 3D room is open                  |
+| `hypr3d.first_person_body([on])`  | set the first-person body (no argument toggles it) |
 | `hypr3d.on_state(fn)`              | call `fn(open)` whenever the room opens or closes |
 | `hypr3d.config({params})`          | see [Config parameters](#config-parameters)       |
 
@@ -213,6 +214,8 @@ Everything is optional -- only set what you want to change.
 | spawn            | [Vector3](#vector)                  | { 0, 0, 0 } | player spawn point                                    |
 | flying           | bool                                | true        | disables falling                                      |
 | walk_bob         | bool                                | true        | simulate the rhythm of walking                        |
+| first_person_body | bool                               | false       | show the character (without its head) in first person |
+| first_person_offset | float                            | 0.2         | first-person body: metres behind the eye              |
 | collision        | bool                                | true        | whether body collides with the world                  |
 
 ### Scene
