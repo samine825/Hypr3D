@@ -7298,9 +7298,7 @@ APICALL EXPORT PLUGIN_DESCRIPTION_INFO PLUGIN_INIT(HANDLE handle) {
     HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:toggle", dispatchToggle);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:open", dispatchOpen);
     HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:close", dispatchClose);
-
-    if (!HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:toggle_flight", dispatchToggleFlight))
-        throw std::runtime_error("[hypr3d] failed to register toggle_flight dispatcher");
+    HyprlandAPI::addDispatcherV2(PHANDLE, "hypr3d:toggle_flight", dispatchToggleFlight);
 
     if (!HyprlandAPI::addLuaFunction(PHANDLE, "hypr3d", "toggle", luaToggle))
         throw std::runtime_error("[hypr3d] failed to register Lua toggle");
